@@ -1,0 +1,11 @@
+/data/
+/smallem/target/
+/smallem-cuda/target/
+# Fichiers intermédiaires que cuda-oxide écrit à la racine du paquet.
+/smallem-cuda/*.ll
+/smallem-cuda/*.ptx
+# Plans et séries d'articles.
+/PLAN*.md
+/BLOG.md
+/blog/
+/blog-*/

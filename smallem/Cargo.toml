@@ -1,0 +1,13 @@
+[package]
+name = "smallem"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+
+[dependencies]
+# Lecture du corpus uniquement. Sans les fonctionnalités par défaut pour éviter
+# de tirer Arrow : l'API par lignes suffit.
+parquet = { version = "60", default-features = false, features = ["snap", "zstd"] }
+rand = "0.10"
+serde_json = "1.0.152"

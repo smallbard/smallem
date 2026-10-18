@@ -1,0 +1,22 @@
+[package]
+name = "smallem-cuda"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+
+[lib]
+# Les kernels ne se testent que sur une carte : tous les tests de ce paquet
+# sont des tests d'intégration, dans `tests/`. La bibliothèque n'est ainsi
+# compilée qu'une fois, et son module de kernels écrit une seule fois.
+test = false
+doctest = false
+
+[dependencies]
+smallem = { path = "../smallem" }
+cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "a73ec6ef7fe2922c93f5d1e1f2e3de67c891a760" }
+cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "a73ec6ef7fe2922c93f5d1e1f2e3de67c891a760" }
+# Same git source as cuda-host, which depends on the in-repo cuda-core: the
+# crates.io release would be a second, incompatible cuda_core to rustc.
+cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "a73ec6ef7fe2922c93f5d1e1f2e3de67c891a760" }
+rand = "0.10"
