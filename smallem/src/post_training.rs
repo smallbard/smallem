@@ -228,18 +228,12 @@ pub fn sequence_log_probs<B: Backend>(
     let log_probs = tape.log_softmax(flat);
     // Pour chaque position notée, la log-probabilité de sa cible, puis la
     // somme par séquence : une matrice `[batch, positions notées]` de 0 et
-    // de 1 fait les deux d'un coup.
+    // de 1.
     let rows: Vec<u32> = (0..tokens.len() as u32)
         .filter(|&i| scored[i as usize])
         .collect();
-    let picked = tape.gather_rows(log_probs, &rows);
+    let per_position = target_log_probs(tape, log_probs, &rows, targets, vocab);
     let backend = tape.backend();
-    let mut one_hot = vec![B::Scalar::ZERO; rows.len() * vocab];
-    for (i, &row) in rows.iter().enumerate() {
-        one_hot[i * vocab + targets[row as usize] as usize] = B::Scalar::ONE;
-    }
-    let one_hot = tape.constant(backend.from_vec(one_hot, &[rows.len(), vocab]));
-    let per_position = tape.sum(tape.mul(picked, one_hot), 1, false);
     let mut owner = vec![B::Scalar::ZERO; batch * rows.len()];
     for (i, &row) in rows.iter().enumerate() {
         owner[(row as usize / length) * rows.len() + i] = B::Scalar::ONE;
@@ -310,15 +304,33 @@ pub fn token_log_probs<B: Backend>(
     let rows: Vec<u32> = (0..tokens.len() as u32)
         .filter(|&i| scored[i as usize])
         .collect();
-    let picked = tape.gather_rows(tape.log_softmax(flat), &rows);
-    let backend = tape.backend();
-    let mut one_hot = vec![B::Scalar::ZERO; rows.len() * vocab];
-    for (i, &row) in rows.iter().enumerate() {
-        one_hot[i * vocab + targets[row as usize] as usize] = B::Scalar::ONE;
-    }
-    let one_hot = tape.constant(backend.from_vec(one_hot, &[rows.len(), vocab]));
+    let picked = target_log_probs(tape, tape.log_softmax(flat), &rows, targets, vocab);
     let owners = rows.iter().map(|&row| row as usize / length).collect();
-    (tape.sum(tape.mul(picked, one_hot), 1, false), owners)
+    (picked, owners)
+}
+
+/// La log-probabilité de la cible de chaque ligne de `rows`, `[n]`, prise
+/// dans `log_probs`, `[positions, vocab]`. Vue comme une seule colonne de
+/// `positions × vocab` lignes, la table donne chacune par un `gather_rows`,
+/// sans matrice de sélection.
+fn target_log_probs<B: Backend>(
+    tape: &Tape<B>,
+    log_probs: Var,
+    rows: &[u32],
+    targets: &[u32],
+    vocab: usize,
+) -> Var {
+    let positions = tape.shape(log_probs)[0];
+    assert!(
+        positions * vocab <= u32::MAX as usize,
+        "trop de log-probabilités pour des indices sur 32 bits"
+    );
+    let column = tape.reshape(log_probs, &[positions * vocab, 1]);
+    let indices: Vec<u32> = rows
+        .iter()
+        .map(|&row| row * vocab as u32 + targets[row as usize])
+        .collect();
+    tape.reshape(tape.gather_rows(column, &indices), &[rows.len()])
 }
 
 /// Les réglages de la perte de GRPO.
