@@ -74,6 +74,14 @@ pub fn forward_macs(config: &GptConfig, batch: usize, length: usize) -> Option<u
             };
         }
     }
+    // La mémoire de n-grammes : lire ses lignes ne multiplie rien ; ses
+    // projections, `d_mém → C` pour les valeurs et, avec la porte, pour les
+    // clés, si. La porte et la convolution ne font que quelques opérations
+    // par élément.
+    if let Some(memory) = architecture.memory {
+        let projections = if memory.gate { 2 } else { 1 };
+        macs += projections * tokens * memory.dim as u64 * c;
+    }
     // La sortie : chaque état caché face à toute la table d'embedding.
     Some(macs + tokens * c * v)
 }
@@ -109,6 +117,7 @@ mod tests {
     use crate::model::Gpt;
     use crate::model::tests::TINY;
     use crate::nn::{Architecture, LatentDims};
+    use crate::nn::{MemoryDims, MemoryStorage};
     use crate::optim::Sgd;
     use crate::training::train_step;
 
@@ -263,6 +272,11 @@ mod tests {
             Architecture::MODERN.with_own_keys(1),
             Architecture::MODERN.with_passes(2),
             latent,
+            Architecture::MODERN.with_memory(MemoryDims {
+                heads: 2,
+                storage: MemoryStorage::Dense,
+                ..MemoryDims::engram(8, 13)
+            }),
         ] {
             let config = config.with_architecture(architecture);
             let counted = counted_step(config, 3);

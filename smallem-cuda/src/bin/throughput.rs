@@ -15,6 +15,9 @@
 //! --cpu [reference]  sur le processeur : le backend `Fast`, ou `Cpu<f32>`
 //! --int8-activations avec --cpu, des activations en octets devant les poids
 //!                    quantifiés (`vpdpbusd`)
+//! --no-memory        coupe la mémoire de n-grammes du modèle, s'il en a une
+//! --memory-host      garde la table de la mémoire en mémoire centrale : la
+//!                    carte ne reçoit que les lignes lues
 //! --check            vérifie que chaque séquence du plus grand lot donne les
 //!                    tokens qu'elle donne seule
 //! ```
@@ -58,6 +61,8 @@ struct Options {
     quantize_output: bool,
     cpu: Option<bool>,
     int8_activations: bool,
+    no_memory: bool,
+    memory_host: bool,
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -73,6 +78,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         quantize_output: false,
         cpu: None,
         int8_activations: false,
+        no_memory: false,
+        memory_host: false,
     };
     let mut args = Args::from_env();
     while let Some(flag) = args.next() {
@@ -91,6 +98,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             "--quantize-output" => options.quantize_output = true,
             "--cpu" => options.cpu = Some(args.accept("reference")),
             "--int8-activations" => options.int8_activations = true,
+            "--no-memory" => options.no_memory = true,
+            "--memory-host" => options.memory_host = true,
             other => return Err(format!("option inconnue : {other}").into()),
         }
     }
@@ -124,6 +133,25 @@ fn run<B: Backend>(backend: &B, options: &Options) -> Result<(), Box<dyn Error>>
     let gpu = backend;
     let mut model = Gpt::new(gpu, config, &mut StdRng::seed_from_u64(0));
     load_parameters(&file, gpu, &mut model)?;
+    if options.memory_host {
+        let memory = model
+            .memory_mut()
+            .ok_or("--memory-host : le modèle n'a pas de mémoire")?;
+        memory.move_to_host(gpu)?;
+    }
+    if let Some(memory) = model.memory() {
+        memory.set_enabled(!options.no_memory);
+        println!(
+            "mémoire de n-grammes : {} paramètres de table{}{}",
+            memory.table_parameters(),
+            if options.memory_host {
+                ", en mémoire centrale"
+            } else {
+                ""
+            },
+            if options.no_memory { ", coupée" } else { "" }
+        );
+    }
     if let Some(format) = options.quantize {
         model.quantize(gpu, format);
         if options.quantize_output {

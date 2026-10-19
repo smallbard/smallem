@@ -57,7 +57,7 @@ pub fn train_step_clipped<B: Backend, M: Module<B>>(
 /// pas, il rendrait NaN tous les paramètres et tous les moments d'Adam,
 /// sans retour possible. Le pas est alors sauté, et c'est à l'appelant de
 /// réagir en lisant la norme renvoyée.
-fn clip_scale(norm: f64, max_norm: f64) -> Option<f64> {
+pub fn clip_scale(norm: f64, max_norm: f64) -> Option<f64> {
     if !norm.is_finite() {
         None
     } else if norm > max_norm {
@@ -86,7 +86,31 @@ pub fn train_step_accumulated<B: Backend, M: Module<B>>(
     optimizer: &mut impl Optimizer<B>,
     max_norm: f64,
     micro_batches: usize,
+    loss: impl FnMut(&M, &Tape<B>, usize) -> Var,
+) -> (B::Tensor, f64) {
+    train_step_observed(
+        backend,
+        model,
+        optimizer,
+        max_norm,
+        micro_batches,
+        loss,
+        |_, _, _| {},
+    )
+}
+
+/// [`train_step_accumulated`], qui montre en plus à `observe` les gradients
+/// de chaque lot, avec le numéro de sa tape : de quoi récupérer ceux que
+/// l'optimiseur du modèle ne voit pas, comme ceux d'une mémoire de
+/// n-grammes creuse.
+pub fn train_step_observed<B: Backend, M: Module<B>>(
+    backend: &B,
+    model: &mut M,
+    optimizer: &mut impl Optimizer<B>,
+    max_norm: f64,
+    micro_batches: usize,
     mut loss: impl FnMut(&M, &Tape<B>, usize) -> Var,
+    mut observe: impl FnMut(&mut M, u64, &Gradients<B>),
 ) -> (B::Tensor, f64) {
     assert!(micro_batches > 0, "il faut au moins un lot");
     let mut grad_sums: Vec<Option<B::Tensor>> = vec![None; model.parameters().len()];
@@ -94,6 +118,7 @@ pub fn train_step_accumulated<B: Backend, M: Module<B>>(
     for index in 0..micro_batches {
         let (loss_value, tape_id, grads) =
             loss_and_gradients(backend, model, |m, t| loss(m, t, index));
+        observe(model, tape_id, &grads);
         for (sum, parameter) in grad_sums.iter_mut().zip(model.parameters()) {
             let Some(grad) = parameter.grad(tape_id, &grads) else {
                 continue;

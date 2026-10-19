@@ -17,13 +17,13 @@ use std::collections::BTreeMap;
 use rand::Rng;
 use serde_json::{Value, json};
 
-use crate::autograd::{Tape, Var};
+use crate::autograd::{Gradients, Tape, Var};
 use crate::backend::{Backend, Float};
 use crate::cache::{CacheStep, KvCache, PAGE_SIZE, SequenceId};
 use crate::nn::{
     Adapter, Architecture, AttentionKind, Balance, Block, Calibration, Embedding, ExpertDims,
-    FeedForwardKind, LatentDims, MixtureOfExperts, Module, MultiToken, MultiTokenHead, Norm,
-    Parameter, PositionKind, Rope, module,
+    FeedForwardKind, LatentDims, Memory, MemoryDims, MemoryStorage, MixtureOfExperts, Module,
+    MultiToken, MultiTokenHead, Norm, Parameter, PositionKind, Rope, module,
 };
 use crate::quantize::{Format, Quantized};
 
@@ -167,6 +167,9 @@ impl GptConfig {
                     .to_string());
             }
         }
+        if let Some(memory) = self.architecture.memory {
+            memory.validate(self.layers)?;
+        }
         if self.architecture.passes == 0 {
             return Err("la pile de blocs doit être traversée au moins une fois".to_string());
         }
@@ -291,6 +294,24 @@ impl GptConfig {
         if let Some(own_keys) = self.architecture.own_keys {
             json["architecture"]["own_keys"] = json!(own_keys);
         }
+        if let Some(memory) = self.architecture.memory {
+            json["architecture"]["memory"] = json!({
+                "rows": memory.rows,
+                "heads": memory.heads,
+                "max_order": memory.max_order,
+                "dim": memory.dim,
+                "layer": memory.layer,
+                "gate": memory.gate,
+                "conv": memory.conv,
+                "storage": match memory.storage {
+                    MemoryStorage::Dense => "dense",
+                    MemoryStorage::Sparse => "sparse",
+                    MemoryStorage::Host => "host",
+                },
+                "table_std": memory.table_std,
+                "lr_scale": memory.lr_scale,
+            });
+        }
         json
     }
 
@@ -394,6 +415,38 @@ impl GptConfig {
                 late_weight: weight("late_weight")?,
             }))
         }
+        fn memory(json: &Value) -> Result<Option<MemoryDims>, String> {
+            if json.is_null() {
+                return Ok(None);
+            }
+            let field =
+                |key: &str| format!("configuration : mémoire : champ `{key}` absent ou illisible");
+            let size = |key: &str| -> Result<usize, String> {
+                json[key]
+                    .as_u64()
+                    .map(|value| value as usize)
+                    .ok_or_else(|| field(key))
+            };
+            let flag = |key: &str| json[key].as_bool().ok_or_else(|| field(key));
+            let number = |key: &str| json[key].as_f64().ok_or_else(|| field(key));
+            Ok(Some(MemoryDims {
+                rows: size("rows")?,
+                heads: size("heads")?,
+                max_order: size("max_order")?,
+                dim: size("dim")?,
+                layer: size("layer")?,
+                gate: flag("gate")?,
+                conv: flag("conv")?,
+                storage: match json["storage"].as_str() {
+                    Some("dense") => MemoryStorage::Dense,
+                    Some("sparse") => MemoryStorage::Sparse,
+                    Some("host") => MemoryStorage::Host,
+                    _ => return Err(field("storage")),
+                },
+                table_std: number("table_std")?,
+                lr_scale: number("lr_scale")?,
+            }))
+        }
         /// Un entier facultatif : absent, il vaut `None`.
         fn count(json: &Value, name: &str) -> Result<Option<usize>, String> {
             if json.is_null() {
@@ -420,6 +473,7 @@ impl GptConfig {
                 multi_token: multi_token(&architecture["multi_token"])?,
                 passes: count(&architecture["passes"], "passes")?.unwrap_or(1),
                 own_keys: count(&architecture["own_keys"], "own_keys")?,
+                memory: memory(&architecture["memory"])?,
             },
         };
         config
@@ -443,6 +497,8 @@ pub struct Gpt<B: Backend> {
     /// Le module de prédiction multi-token, s'il y en a un. Il ne sert qu'à
     /// [`Gpt::training_loss`].
     multi_token: Option<MultiTokenHead<B>>,
+    /// La mémoire de n-grammes, s'il y en a une.
+    memory: Option<Memory<B>>,
     /// Part de l'entraînement déjà faite, entre 0 et 1 : le poids de la
     /// prédiction multi-token en dépend.
     progress: Cell<f64>,
@@ -489,6 +545,10 @@ impl<B: Backend> Gpt<B> {
                     rng,
                 )
             }),
+            memory: config
+                .architecture
+                .memory
+                .map(|dims| Memory::new(backend, dims, config.embed, rng)),
             progress: Cell::new(0.0),
             output_scale: 1.0,
         }
@@ -533,16 +593,33 @@ impl<B: Backend> Gpt<B> {
         // sont calculés une fois ici, et chaque bloc s'en sert dans son
         // attention.
         let rope = self.rope(tape, 0, length);
+        // Les lignes de la mémoire ne dépendent que des tokens : elles se
+        // calculent avant tout le reste.
+        let memory = self
+            .memory
+            .as_ref()
+            .map(|memory| (memory, memory.hash().indices(tokens, batch)));
 
         // La pile est traversée une fois, ou plusieurs : les mêmes blocs
         // resservent alors, sur d'autres états cachés.
-        for _ in 0..self.config.architecture.passes {
+        for pass in 0..self.config.architecture.passes {
             // Les clés et les valeurs du dernier bloc qui en a calculé,
             // pour ceux qui empruntent les leurs.
             let mut lent = None;
-            for block in &self.blocks {
+            for (index, block) in self.blocks.iter().enumerate() {
+                if let Some((memory, indices)) = &memory
+                    && pass == 0
+                    && index == memory.dims().layer
+                {
+                    x = memory.forward(tape, x, indices, length);
+                }
                 x = block.forward(tape, x, rope, None, &mut lent);
             }
+        }
+        if let Some((memory, indices)) = &memory
+            && memory.dims().layer == self.blocks.len()
+        {
+            x = memory.forward(tape, x, indices, length);
         }
         x
     }
@@ -629,14 +706,44 @@ impl<B: Backend> Gpt<B> {
             x = tape.add(x, tape.reshape(embedded, &[1, rows, dim]));
         }
         self.set_rope(tape, &mut step, &positions);
+        // Les n-grammes des nouveaux tokens ont besoin des derniers tokens
+        // de chaque séquence : le cache les garde.
+        let memory = self.memory.as_ref().map(|memory| {
+            let hash = memory.hash();
+            let keep = hash.max_order() - 1;
+            let mut indices = Vec::with_capacity(rows * hash.tables());
+            let mut gram = vec![0u32; hash.max_order()];
+            for (id, tokens) in entries {
+                let mut combined = cache.recent(*id).to_vec();
+                let past = combined.len();
+                combined.extend_from_slice(tokens);
+                for t in past..combined.len() {
+                    crate::ngram::suffix(&combined, t, &mut gram);
+                    indices.extend(hash.position_indices(&gram));
+                }
+                cache.remember(*id, tokens, keep);
+            }
+            (memory, indices)
+        });
 
         let layers = self.blocks.len();
         for pass in 0..self.config.architecture.passes {
             let mut lent = None;
             for (index, block) in self.blocks.iter().enumerate() {
+                if let Some((memory, indices)) = &memory
+                    && pass == 0
+                    && index == memory.dims().layer
+                {
+                    x = memory.forward_cached(tape, x, indices, cache, &counts);
+                }
                 let stage = cache.stage_mut(pass * layers + index);
                 x = block.forward(tape, x, None, Some((stage, &step)), &mut lent);
             }
+        }
+        if let Some((memory, indices)) = &memory
+            && memory.dims().layer == self.blocks.len()
+        {
+            x = memory.forward_cached(tape, x, indices, cache, &counts);
         }
         x
     }
@@ -1024,6 +1131,30 @@ impl<B: Backend> Gpt<B> {
 
     /// Dit au modèle quelle part de l'entraînement est faite, entre 0 et
     /// 1 : le poids de la prédiction multi-token en dépend.
+    /// La mémoire de n-grammes, s'il y en a une.
+    pub fn memory(&self) -> Option<&Memory<B>> {
+        self.memory.as_ref()
+    }
+
+    pub fn memory_mut(&mut self) -> Option<&mut Memory<B>> {
+        self.memory.as_mut()
+    }
+
+    /// Garde le gradient des lignes que la mémoire a lues pendant la passe
+    /// de la tape `tape` : voir [`Memory::collect`].
+    pub fn collect_memory_gradient(&mut self, tape: u64, grads: &Gradients<B>) {
+        if let Some(memory) = &mut self.memory {
+            memory.collect(tape, grads);
+        }
+    }
+
+    /// Le pas d'AdamW des lignes lues de la mémoire : voir [`Memory::apply`].
+    pub fn apply_memory_gradient(&mut self, backend: &B, learning_rate: f64, grad_scale: f64) {
+        if let Some(memory) = &mut self.memory {
+            memory.apply(backend, learning_rate, grad_scale);
+        }
+    }
+
     pub fn set_training_progress(&self, progress: f64) {
         self.progress.set(progress);
     }
@@ -1094,7 +1225,8 @@ module!(Gpt {
     position_embedding,
     blocks,
     final_norm,
-    multi_token
+    multi_token,
+    memory
 });
 
 #[cfg(test)]
@@ -1224,6 +1356,102 @@ pub(crate) mod tests {
         for (g, q) in last.iter().zip(&quantized[(tokens.len() - 1) * vocab..]) {
             assert!((g - q).abs() < 1e-9, "{g} contre {q}");
         }
+    }
+
+    /// Une mémoire minuscule, avec tout : porte et convolution.
+    fn memory_config(storage: MemoryStorage) -> GptConfig {
+        GptConfig {
+            context: 8,
+            layers: 2,
+            architecture: Architecture::MODERN.with_memory(MemoryDims {
+                heads: 2,
+                storage,
+                ..MemoryDims::engram(8, 17)
+            }),
+            ..TINY
+        }
+    }
+
+    #[test]
+    fn a_memory_reads_the_same_with_or_without_cache() {
+        let backend = Cpu::new();
+        let tokens = [1, 2, 3, 2, 3, 4, 2, 3];
+        for storage in [MemoryStorage::Dense, MemoryStorage::Sparse] {
+            let config = memory_config(storage);
+            let mut rng = StdRng::seed_from_u64(4);
+            let mut model = Gpt::<B>::new(&backend, config, &mut rng);
+            randomize(&mut model, &mut rng);
+            let full = logits_of(&model, &tokens, 1);
+            // La convolution compte : sans elle, les logits changent.
+            let without_conv = {
+                let mut model = Gpt::<B>::new(&backend, config, &mut StdRng::seed_from_u64(4));
+                randomize(&mut model, &mut StdRng::seed_from_u64(4));
+                let memory = model.memory.as_mut().expect("mémoire");
+                memory.conv = Some(Parameter::zeros(&backend, &[4, 8]));
+                logits_of(&model, &tokens, 1)
+            };
+            assert_ne!(without_conv, full);
+            // Par morceaux, à travers le cache : trois, un, puis quatre.
+            let mut cache = model.cache(1);
+            let id = cache.add_sequence();
+            let mut cached = Vec::new();
+            for chunk in [&tokens[..3], &tokens[3..4], &tokens[4..]] {
+                let tape = Tape::new(&backend);
+                let logits = model.forward_cached(&tape, &mut cache, &[(id, chunk)]);
+                cached.extend_from_slice(tape.value(logits).data());
+            }
+            for (a, b) in full.iter().zip(&cached) {
+                assert!((a - b).abs() < 1e-9, "{storage:?} : {a} contre {b}");
+            }
+            // Deux séquences à la fois, par morceaux de tailles différentes.
+            let other = [4, 4, 1, 2, 3, 1, 4, 2];
+            let both: Vec<u32> = tokens.iter().chain(&other).copied().collect();
+            let full_both = logits_of(&model, &both, 2);
+            let mut cache = model.cache(2);
+            let (a, b) = (cache.add_sequence(), cache.add_sequence());
+            let (mut first, mut second) = (Vec::new(), Vec::new());
+            for (x, y) in [(0..3, 0..5), (3..4, 5..6), (4..8, 6..8)] {
+                let tape = Tape::new(&backend);
+                let logits = model.forward_cached(
+                    &tape,
+                    &mut cache,
+                    &[(a, &tokens[x.clone()]), (b, &other[y.clone()])],
+                );
+                let values = tape.value(logits).data().to_vec();
+                let split = x.len() * config.vocab;
+                first.extend_from_slice(&values[..split]);
+                second.extend_from_slice(&values[split..]);
+            }
+            let cached_both: Vec<f64> = first.into_iter().chain(second).collect();
+            for (a, b) in full_both.iter().zip(&cached_both) {
+                assert!(
+                    (a - b).abs() < 1e-9,
+                    "{storage:?}, deux séquences : {a} contre {b}"
+                );
+            }
+            // La table déplacée en mémoire centrale lit les mêmes lignes.
+            if storage == MemoryStorage::Sparse {
+                let mut moved = Gpt::<B>::new(&backend, config, &mut StdRng::seed_from_u64(4));
+                randomize(&mut moved, &mut StdRng::seed_from_u64(4));
+                let before = logits_of(&moved, &tokens, 1);
+                let memory = moved.memory_mut().expect("mémoire");
+                memory.move_to_host(&backend).expect("table creuse");
+                for (a, b) in before.iter().zip(&logits_of(&moved, &tokens, 1)) {
+                    assert!((a - b).abs() < 1e-6, "en mémoire centrale : {a} contre {b}");
+                }
+            }
+            // Sans la mémoire, les logits ne sont plus les mêmes.
+            let mut plain = config;
+            plain.architecture.memory = None;
+            let without = Gpt::<B>::new(&backend, plain, &mut StdRng::seed_from_u64(4));
+            assert_ne!(logits_of(&without, &tokens, 1), full);
+        }
+    }
+
+    #[test]
+    fn a_memory_config_survives_the_file() {
+        let config = memory_config(MemoryStorage::Host);
+        assert_eq!(GptConfig::from_metadata(&config.to_metadata()), Ok(config));
     }
 
     #[test]

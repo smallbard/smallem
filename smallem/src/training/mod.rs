@@ -8,7 +8,9 @@
 pub mod step;
 pub mod trainer;
 
-pub use step::{evaluate, train_step, train_step_accumulated, train_step_clipped};
+pub use step::{
+    evaluate, train_step, train_step_accumulated, train_step_clipped, train_step_observed,
+};
 pub use trainer::{
     Evaluation, Event, Settings, Summary, Trainer, check_resume, step_rng, validation_loss,
 };

@@ -23,7 +23,7 @@ kernels pour la carte.
 
 ```bash
 cargo oxide build
-cargo oxide test              # 142 tests, sur la carte
+cargo oxide test              # 143 tests, sur la carte
 cargo clippy --all-targets    # l'analyse, elle, se passe de cargo oxide
 ```
 
@@ -39,7 +39,7 @@ entraînement.
 | Programme | Rôle |
 |---|---|
 | `train` | entraîne un GPT |
-| `generate` | génère du texte avec un modèle enregistré |
+| `generate` | génère du texte avec un modèle enregistré ; avec `--chat`, répond à une question |
 | `mlp` | modèle à contexte fixe |
 | `gpt2` | compare GPT-2 small chargé dans ce code à PyTorch |
 | `bench` | débit d'entraînement en tokens par seconde |
@@ -54,6 +54,7 @@ entraînement.
 | `sweep` | lance une grille d'entraînements et note les résultats |
 | `mfu` | rendement en opérations de la carte, par taille de modèle |
 | `noise` | bruit du gradient et taille de lot critique |
+| `recall` | ce qu'un modèle doit à sa mémoire de n-grammes : la perte, mémoire coupée ou non, selon la fréquence du contexte |
 
 Chaque programme décrit ses options en tête de son fichier, dans `src/bin/`. `train`,
 `generate` et `throughput` tournent aussi sur le processeur (`--cpu`, avec le backend

@@ -43,6 +43,9 @@ struct Sequence {
     /// Position du prochain token dans la séquence. Elle dépasse `len` dès
     /// que des positions ont été oubliées.
     next_position: usize,
+    /// Ses derniers tokens, du plus ancien au plus récent : les n-grammes
+    /// de la mémoire du modèle, s'il en a une, en ont besoin.
+    recent: Vec<u32>,
 }
 
 /// Le cache de génération de toutes les séquences en cours.
@@ -56,6 +59,9 @@ pub struct KvCache<B: Backend> {
     free: Vec<u32>,
     /// Indexé par [`SequenceId`] ; `None` pour une séquence terminée.
     sequences: Vec<Option<Sequence>>,
+    /// Indexé par [`SequenceId`] : les dernières entrées de la convolution
+    /// de la mémoire de n-grammes, s'il y en a une.
+    memory_rows: Vec<Option<B::Tensor>>,
 }
 
 impl<B: Backend> KvCache<B> {
@@ -79,6 +85,7 @@ impl<B: Backend> KvCache<B> {
             pages,
             free: (0..pages as u32).rev().collect(),
             sequences: Vec::new(),
+            memory_rows: Vec::new(),
         }
     }
 
@@ -118,8 +125,24 @@ impl<B: Backend> KvCache<B> {
         SequenceId(index)
     }
 
+    /// Les dernières entrées de la convolution de la mémoire pour la
+    /// séquence `id`, `[≤ 9, C]`, ou `None` avant sa première passe.
+    pub fn memory_rows(&self, id: SequenceId) -> Option<&B::Tensor> {
+        self.memory_rows.get(id.0)?.as_ref()
+    }
+
+    pub fn set_memory_rows(&mut self, id: SequenceId, rows: B::Tensor) {
+        if self.memory_rows.len() <= id.0 {
+            self.memory_rows.resize_with(id.0 + 1, || None);
+        }
+        self.memory_rows[id.0] = Some(rows);
+    }
+
     /// Termine une séquence : ses pages retournent à la réserve.
     pub fn remove_sequence(&mut self, id: SequenceId) {
+        if let Some(rows) = self.memory_rows.get_mut(id.0) {
+            *rows = None;
+        }
         let sequence = self.sequences[id.0].take().expect("séquence déjà terminée");
         self.free.extend(sequence.pages.iter().rev());
     }
@@ -130,6 +153,21 @@ impl<B: Backend> KvCache<B> {
 
     fn sequence_mut(&mut self, id: SequenceId) -> &mut Sequence {
         self.sequences[id.0].as_mut().expect("séquence terminée")
+    }
+
+    /// Les derniers tokens de la séquence `id`, du plus ancien au plus
+    /// récent : ceux que [`KvCache::remember`] a gardés.
+    pub fn recent(&self, id: SequenceId) -> &[u32] {
+        &self.sequence(id).recent
+    }
+
+    /// Ajoute `tokens` aux derniers tokens de la séquence `id`, et n'en
+    /// garde que les `keep` plus récents.
+    pub fn remember(&mut self, id: SequenceId, tokens: &[u32], keep: usize) {
+        let recent = &mut self.sequence_mut(id).recent;
+        recent.extend_from_slice(tokens);
+        let excess = recent.len().saturating_sub(keep);
+        recent.drain(..excess);
     }
 
     /// Nombre de positions gardées pour la séquence `id`.

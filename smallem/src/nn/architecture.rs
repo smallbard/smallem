@@ -1,6 +1,8 @@
 //! Les choix d'architecture d'un bloc : quelle normalisation, quel
 //! feed-forward, quelle attention, quelle façon de connaître les positions.
 
+use super::MemoryDims;
+
 /// Les choix d'architecture d'un bloc. Chaque variante remplace une pièce du
 /// GPT-2 d'origine par celle qu'utilisent les modèles récents.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -24,6 +26,9 @@ pub struct Architecture {
     /// comparent aux clés du bloc `n`, dont ils lisent aussi les valeurs :
     /// le cache de génération n'a que `n` étages (Gemma 4).
     pub own_keys: Option<usize>,
+    /// Avec `Some`, une mémoire de n-grammes s'ajoute au flux avant l'un des
+    /// blocs (Engram).
+    pub memory: Option<MemoryDims>,
 }
 
 impl Architecture {
@@ -38,6 +43,7 @@ impl Architecture {
         multi_token: None,
         passes: 1,
         own_keys: None,
+        memory: None,
     };
 
     /// Le socle des modèles récents : RMSNorm, SwiGLU et RoPE.
@@ -50,6 +56,7 @@ impl Architecture {
         multi_token: None,
         passes: 1,
         own_keys: None,
+        memory: None,
     };
 
     /// La même architecture, dont la pile de blocs est traversée `passes`
@@ -82,6 +89,14 @@ impl Architecture {
     pub const fn with_multi_token(self, multi_token: MultiToken) -> Self {
         Self {
             multi_token: Some(multi_token),
+            ..self
+        }
+    }
+
+    /// La même architecture, avec une mémoire de n-grammes.
+    pub const fn with_memory(self, memory: MemoryDims) -> Self {
+        Self {
+            memory: Some(memory),
             ..self
         }
     }

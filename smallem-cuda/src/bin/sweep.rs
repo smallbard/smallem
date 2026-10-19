@@ -16,8 +16,11 @@
 //! une ligne de `DOSSIER/results.tsv` :
 //!
 //! ```text
-//! nom  paramètres  opérations  pas  nats/octet  tokens/s  secondes
+//! nom  paramètres  opérations  pas  nats/octet  tokens/s  secondes  table
 //! ```
+//!
+//! `paramètres` compte le réseau, ce qui calcule ; `table` la table d'une
+//! mémoire de n-grammes, 0 sans mémoire.
 //!
 //! La perte est la perte de validation finale, sur 200 lots. Un
 //! entraînement qui échoue est noté avec une perte `NaN`, pour ne pas le
@@ -38,13 +41,16 @@ struct Outcome {
     steps: Option<u64>,
     loss: Option<f64>,
     rate: Option<f64>,
+    table: Option<u64>,
 }
 
 fn read_log(log: &str) -> Outcome {
     let mut outcome = Outcome::default();
     for line in log.lines() {
         let words: Vec<&str> = line.split_whitespace().collect();
-        if line.contains(" paramètres, vocabulaire") {
+        if line.starts_with("mémoire de n-grammes") {
+            outcome.table = words.get(4).and_then(|w| w.parse().ok());
+        } else if line.contains(" paramètres, vocabulaire") {
             outcome.parameters = words.first().and_then(|w| w.parse().ok());
         } else if line.contains("opérations par pas") {
             outcome.flops = words
@@ -96,7 +102,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     if !results.exists() {
         fs::write(
             &results,
-            "nom\tparamètres\topérations\tpas\tnats/octet\ttokens/s\tsecondes\n",
+            "nom\tparamètres\topérations\tpas\tnats/octet\ttokens/s\tsecondes\ttable\n",
         )?;
     }
     let train = std::env::current_exe()?.with_file_name("train");
@@ -128,12 +134,13 @@ fn main() -> Result<(), Box<dyn Error>> {
         let outcome = read_log(&log);
         let field = |value: Option<String>| value.unwrap_or_else(|| "?".into());
         let row = format!(
-            "{name}\t{}\t{}\t{}\t{}\t{}\t{seconds:.0}\n",
+            "{name}\t{}\t{}\t{}\t{}\t{}\t{seconds:.0}\t{}\n",
             field(outcome.parameters.map(|p| p.to_string())),
             field(outcome.flops.map(|f| format!("{f:.3e}"))),
             field(outcome.steps.map(|s| s.to_string())),
             outcome.loss.map_or("NaN".into(), |l| format!("{l:.4}")),
             field(outcome.rate.map(|r| format!("{r:.0}"))),
+            outcome.table.unwrap_or(0),
         );
         OpenOptions::new()
             .append(true)

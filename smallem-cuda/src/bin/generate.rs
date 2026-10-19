@@ -8,7 +8,8 @@
 //!                      du modèle s'il existe, sinon des octets)
 //! --prompt TEXTE       début du texte (défaut : "The ")
 //! --tokens N           nombre de tokens à générer (défaut : 500)
-//! --temperature X      0 = toujours le plus probable ; 1 = fidèle au modèle (défaut : 1)
+//! --temperature X      0 = toujours le plus probable ; 1 = fidèle au modèle
+//!                      (défaut : 1, et 0 avec --chat)
 //! --top-k N            ne garder que les N tokens les plus probables
 //! --top-p X            ne garder que les tokens formant une probabilité cumulée X
 //! --seed N             graine du hasard (défaut : 42)
@@ -19,6 +20,18 @@
 //! --quantize-output    avec --quantize, la table de sortie aussi
 //! --cpu [reference]    sur le processeur, sans la carte : le backend `Fast`,
 //!                      ou avec `reference`, le backend de référence `Cpu<f32>`
+//! --chat               pose l'amorce comme une question, entre les tokens de
+//!                      rôle, à un modèle post-entraîné ; la réponse s'arrête
+//!                      au `<|fin|>`. Le tokeniseur par défaut est alors
+//!                      ../data/bpe/tokenizer.bpe s'il n'y en a pas à côté du
+//!                      modèle.
+//! ```
+//!
+//! Par exemple, avec un modèle de la série sur le post-entraînement :
+//!
+//! ```text
+//! cargo oxide run --bin generate -- --model ../data/post/sft.safetensors --chat \
+//!     --prompt "Sort from smallest to largest: 42, 7, 19, 3"
 //! ```
 
 use std::error::Error;
@@ -31,6 +44,7 @@ use rand::rngs::StdRng;
 use smallem::backend::Backend;
 use smallem::backend::cpu::Cpu;
 use smallem::backend::fast::Fast;
+use smallem::chat::{ROLE_NAMES, Roles};
 use smallem::cli::Args;
 use smallem::generation::Generator;
 use smallem::io::{SafeTensors, load_parameters};
@@ -52,6 +66,7 @@ struct Options {
     cpu: Option<Processor>,
     quantize: Option<Format>,
     quantize_output: bool,
+    chat: bool,
 }
 
 /// Le backend du processeur choisi par `--cpu`.
@@ -76,7 +91,9 @@ impl Options {
             cpu: None,
             quantize: None,
             quantize_output: false,
+            chat: false,
         };
+        let mut temperature = None;
         let mut args = Args::from_env();
         while let Some(flag) = args.next() {
             match flag.as_str() {
@@ -84,7 +101,7 @@ impl Options {
                 "--tokenizer" => options.tokenizer = Some(args.value(&flag)?),
                 "--prompt" => options.prompt = args.value(&flag)?,
                 "--tokens" => options.tokens = args.value(&flag)?,
-                "--temperature" => options.sampling.temperature = args.value(&flag)?,
+                "--temperature" => temperature = Some(args.value(&flag)?),
                 "--top-k" => options.sampling.top_k = Some(args.value(&flag)?),
                 "--top-p" => options.sampling.top_p = Some(args.value(&flag)?),
                 "--seed" => options.seed = args.value(&flag)?,
@@ -95,9 +112,12 @@ impl Options {
                 "--quantize-output" => options.quantize_output = true,
                 "--cpu" if args.accept("reference") => options.cpu = Some(Processor::Reference),
                 "--cpu" => options.cpu = Some(Processor::Fast),
+                "--chat" => options.chat = true,
                 other => return Err(format!("option inconnue : {other}").into()),
             }
         }
+        // En conversation, la réponse la plus probable, comme à l'évaluation.
+        options.sampling.temperature = temperature.unwrap_or(if options.chat { 0.0 } else { 1.0 });
         if options.prompt.is_empty() {
             return Err("l'amorce ne peut pas être vide".into());
         }
@@ -108,12 +128,15 @@ impl Options {
     }
 
     /// Le tokeniseur du modèle : celui qu'on a désigné, sinon celui qui se
-    /// trouve à côté du fichier de poids, sinon les octets.
+    /// trouve à côté du fichier de poids, sinon, en conversation, celui des
+    /// données, sinon les octets.
     fn tokenizer(&self) -> Result<Bpe, Box<dyn Error>> {
         let beside = self.model.with_file_name("tokenizer.bpe");
+        let data = PathBuf::from("../data/bpe/tokenizer.bpe");
         match &self.tokenizer {
             Some(path) => Ok(Bpe::load(path)?),
             None if beside.exists() => Ok(Bpe::load(beside)?),
+            None if self.chat && data.exists() => Ok(Bpe::load(data)?),
             None => Ok(Bpe::bytes()),
         }
     }
@@ -128,11 +151,22 @@ fn run<B: Backend>(
     // module de prédiction multi-token, que la génération ignore.
     let config = GptConfig::from_metadata(&file.metadata)?.for_inference();
     let tokenizer = options.tokenizer()?;
-    if tokenizer.vocab_size() != config.vocab {
+    // En conversation, les trois tokens de rôle suivent le vocabulaire du texte.
+    let roles = options.chat.then(|| Roles::after(tokenizer.vocab_size()));
+    let expected = roles.map_or(tokenizer.vocab_size(), |roles| roles.vocab());
+    if expected != config.vocab {
+        let hint = if options.chat {
+            "ce modèle n'a pas de tokens de rôle, ou préciser --tokenizer"
+        } else if Bpe::load("../data/bpe/tokenizer.bpe")
+            .is_ok_and(|data| Roles::after(data.vocab_size()).vocab() == config.vocab)
+        {
+            "un modèle post-entraîné : ajouter --chat"
+        } else {
+            "préciser --tokenizer"
+        };
         return Err(format!(
-            "le modèle attend {} tokens, le tokeniseur en a {} : préciser --tokenizer",
+            "le modèle attend {} tokens, le tokeniseur en donne {expected} : {hint}",
             config.vocab,
-            tokenizer.vocab_size(),
         )
         .into());
     }
@@ -149,11 +183,14 @@ fn run<B: Backend>(
     }
     let mut rng = StdRng::seed_from_u64(options.seed);
 
-    let prompt: Vec<u32> = tokenizer
-        .encode(&options.prompt)
-        .iter()
-        .map(|&t| u32::from(t))
-        .collect();
+    let prompt: Vec<u32> = match roles {
+        Some(roles) => smallem::chat::prompt(&tokenizer, roles, &options.prompt),
+        None => tokenizer
+            .encode(&options.prompt)
+            .iter()
+            .map(|&t| u32::from(t))
+            .collect(),
+    };
     let mut generator = if options.no_cache {
         Generator::without_cache(backend, &model, &prompt)
     } else {
@@ -161,21 +198,39 @@ fn run<B: Backend>(
     };
 
     // Le texte s'affiche à mesure qu'il s'écrit.
+    // Les tokens de rôle n'ont pas de texte : on écrit leur nom.
+    let base = tokenizer.vocab_size() as u32;
     let mut decoder = tokenizer.decoder();
     let mut out = std::io::stdout();
+    let mut show = |token: u32, out: &mut std::io::Stdout| -> std::io::Result<()> {
+        if token < base {
+            write!(out, "{}", decoder.push(token as u16))
+        } else {
+            let rest = std::mem::replace(&mut decoder, tokenizer.decoder()).finish();
+            let name = ROLE_NAMES[(token - base) as usize];
+            let before = if token == base { "" } else { "\n" };
+            writeln!(out, "{rest}{before}{name}")
+        }
+    };
     for &token in &prompt {
-        write!(out, "{}", decoder.push(token as u16))?;
+        show(token, &mut out)?;
     }
     let start = Instant::now();
+    let mut generated = 0;
     for _ in 0..options.tokens {
         let token = generator.next_token(&options.sampling, &mut rng);
-        write!(out, "{}", decoder.push(token as u16))?;
+        generated += 1;
+        show(token, &mut out)?;
         out.flush()?;
+        if roles.is_some_and(|roles| token == roles.end) {
+            break;
+        }
     }
     let seconds = start.elapsed().as_secs_f64();
+    drop(show);
     writeln!(out, "{}", decoder.finish())?;
     // Sur la sortie d'erreur, pour ne pas se mêler au texte généré.
-    eprintln!("{:.0} tokens par seconde", options.tokens as f64 / seconds);
+    eprintln!("{:.0} tokens par seconde", generated as f64 / seconds);
     if let Some((cache, sequence)) = generator.cache() {
         let numbers = cache.numbers_per_position(backend);
         let mib =

@@ -12,11 +12,12 @@ use smallem::data::Dataset;
 use smallem::generation::{Generator, generate};
 use smallem::model::{Gpt, GptConfig};
 use smallem::nn::{
-    Architecture, AttentionKind, Balance, ExpertDims, LatentDims, Module, MultiToken,
+    Architecture, AttentionKind, Balance, ExpertDims, LatentDims, MemoryDims, MemoryStorage,
+    Module, MultiToken,
 };
 use smallem::optim::AdamW;
 use smallem::sampling::Sampling;
-use smallem::training::{evaluate, train_step, train_step_accumulated};
+use smallem::training::{evaluate, train_step, train_step_accumulated, train_step_observed};
 use smallem_cuda::Cuda;
 
 const VOCAB: usize = 257;
@@ -668,5 +669,72 @@ fn multi_token_prediction_follows_the_cpu_loss_curve() {
             (c - g).abs() < 2e-3,
             "pas {step} : CPU {c}, GPU {g}\nCPU {cpu:?}\nGPU {gpu:?}"
         );
+    }
+}
+
+/// Entraîne un modèle moderne avec une mémoire de n-grammes, dont la table
+/// est rangée comme `storage` le dit, et renvoie la perte de chaque pas.
+fn memory_loss_curve<B: Backend<Scalar = f32>>(
+    backend: &B,
+    storage: MemoryStorage,
+    steps: usize,
+) -> Vec<f64> {
+    let config = GptConfig {
+        vocab: VOCAB,
+        context: 16,
+        layers: 2,
+        heads: 2,
+        embed: 32,
+        architecture: Architecture::MODERN.with_memory(MemoryDims {
+            heads: 4,
+            storage,
+            ..MemoryDims::engram(32, 101)
+        }),
+    };
+    let mut rng = StdRng::seed_from_u64(5);
+    let mut model = Gpt::new(backend, config, &mut rng);
+    let mut optimizer = AdamW::new(3e-3, 0.1);
+    let dataset = dataset();
+    (0..steps)
+        .map(|_| {
+            let batch = dataset.sample_batch(&mut rng, 8, config.context);
+            let (tokens, targets) = batch.examples();
+            let (loss, _) = train_step_observed(
+                backend,
+                &mut model,
+                &mut optimizer,
+                f64::INFINITY,
+                1,
+                |m, t, _| m.training_loss(t, &tokens, &targets, 8),
+                |m, tape, grads| m.collect_memory_gradient(tape, grads),
+            );
+            model.apply_memory_gradient(backend, 3e-3, 1.0);
+            backend.item(&loss).to_f64()
+        })
+        .collect()
+}
+
+#[test]
+fn a_memory_follows_the_cpu_loss_curve() {
+    const STEPS: usize = 20;
+    for storage in [
+        MemoryStorage::Dense,
+        MemoryStorage::Sparse,
+        MemoryStorage::Host,
+    ] {
+        let cpu = memory_loss_curve(&Cpu::<f32>::new(), storage, STEPS);
+        let gpu = memory_loss_curve(&Cuda::new(0).unwrap(), storage, STEPS);
+        assert!(
+            cpu[STEPS - 1] < cpu[0] - 0.5,
+            "{storage:?} n'apprend pas : {cpu:?}"
+        );
+        // AdamW sur des lignes dont le gradient est petit grossit les écarts
+        // d'arrondi : la tolérance est plus large que pour le modèle seul.
+        for (step, (c, g)) in cpu.iter().zip(&gpu).enumerate() {
+            assert!(
+                (c - g).abs() < 1e-2,
+                "{storage:?}, pas {step} : CPU {c}, GPU {g}\nCPU {cpu:?}\nGPU {gpu:?}",
+            );
+        }
     }
 }

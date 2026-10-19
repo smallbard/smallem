@@ -18,7 +18,7 @@ carte, ni du CUDA Toolkit.
 ## Compiler et tester
 
 ```bash
-cargo test                    # 437 tests, quelques secondes, sans GPU
+cargo test                    # 449 tests, quelques secondes, sans GPU
 cargo clippy --all-targets
 ```
 
@@ -31,6 +31,7 @@ cargo clippy --all-targets
 | `bigram` | modèle bigramme par comptage |
 | `fit` | ajuste les lois d'échelle sur les résultats de `sweep`, et prédit |
 | `cpubench` | ce que vaut le processeur, et ce qu'en tire le backend `Fast` |
+| `ngrams` | compte les bigrammes et les trigrammes du corpus : couverture, collisions du hachage, modèles par comptage |
 
 Chaque programme décrit ses options en tête de son fichier, dans `src/bin/`. Ceux qui
 entraînent et génèrent sont dans `smallem-cuda`.
@@ -52,6 +53,7 @@ cargo oxide run --bin train -- --config xl --arch modern --data ../data/bpe --ba
 #    (avec --balance none|bias|loss), --mtp, --optimizer muon.
 #    Variantes de l'étape 11 : --optimizer muon:short (et period=3, norm, boost=5),
 #    --passes 2, --layers 16, --own-keys 4. Étape 12 : --context 4096.
+#    Mémoire de n-grammes : --memory 262144 (lignes par table), --memory-storage host.
 
 # 3. Générer : le texte s'affiche à mesure qu'il s'écrit.
 cargo oxide run --bin generate -- --model ../data/bpe/gpt-xl.safetensors \
@@ -76,6 +78,9 @@ src/
                                      attention classique et latente, feed-forward,
                                      mélange d'experts, prédiction multi-token, bloc
   nn/lora.rs                         les adaptateurs LoRA
+  nn/memory.rs                       la mémoire de n-grammes : table dense, creuse ou en
+                                     mémoire centrale, porte et convolution
+  ngram.rs                           le hachage des n-grammes, et leurs comptes
   model.rs, mlp.rs                   les modèles
   optim.rs                           les optimiseurs : SGD, AdamW, Muon
   training/                          un pas d'entraînement, puis la boucle complète
@@ -88,5 +93,5 @@ src/
   flops.rs, scaling.rs               le compte des opérations, les lois d'échelle
   io.rs, gpt2.rs                     les fichiers de poids
   cli.rs                             la lecture des options
-  bin/                               prepare, bpe, bigram, fit, cpubench
+  bin/                               prepare, bpe, bigram, fit, cpubench, ngrams
 ```

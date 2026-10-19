@@ -53,6 +53,20 @@
 //!                          les suivantes empruntent celles de la couche N
 //! --mtp                    prédiction multi-token pendant l'entraînement (poids 0.3 puis 0.1)
 //! --mtp-weights X,Y        ses poids : X pendant les deux premiers tiers, Y ensuite
+//! --memory LIGNES          mémoire de n-grammes (Engram) : LIGNES visées par table ; par
+//!                          défaut 8 têtes par ordre, bigrammes et trigrammes, d_mém = C,
+//!                          avant la couche 1, porte et convolution, table creuse
+//! --memory-heads N         têtes de hachage par ordre
+//! --memory-order N         ordre le plus grand (défaut : 3)
+//! --memory-dim N           composantes du vecteur lu (défaut : C)
+//! --memory-layer N         la mémoire s'ajoute avant la couche N (défaut : 1)
+//! --memory-storage dense|sparse|host
+//!                          table dense (gradient de toute la table), creuse (seules les
+//!                          lignes lues, sur la carte) ou en mémoire centrale
+//! --memory-no-gate         sans la porte de contexte
+//! --memory-no-conv         sans la convolution
+//! --memory-std X           écart-type initial des lignes (défaut : 0,02, celui des embeddings)
+//! --memory-lr-scale X      facteur du taux de la table (défaut : 5)
 //! --resume                 reprendre au dernier point de reprise
 //! --mixed                  produits matriciels en bf16 : sur les Tensor Cores, ou avec
 //!                          --cpu, par vdpbf16ps (AVX-512 BF16)
@@ -92,7 +106,8 @@ use smallem::flops;
 use smallem::generation::generate;
 use smallem::model::{Gpt, GptConfig};
 use smallem::nn::{
-    Architecture, AttentionKind, Balance, ExpertDims, LatentDims, Module, MultiToken,
+    Architecture, AttentionKind, Balance, ExpertDims, LatentDims, MemoryDims, MemoryStorage,
+    Module, MultiToken,
 };
 use smallem::sampling::Sampling;
 use smallem::tokenizer::Bpe;
@@ -141,9 +156,44 @@ struct Options {
     context: Option<usize>,
     passes: usize,
     own_keys: Option<usize>,
+    /// `--memory` et ses réglages.
+    memory: Option<MemoryOptions>,
     resume: bool,
     mixed: bool,
     cpu: Option<Processor>,
+}
+
+/// La mémoire de n-grammes demandée : ce qui s'écarte des choix d'Engram.
+#[derive(Clone, Copy, Debug, Default)]
+struct MemoryOptions {
+    rows: usize,
+    heads: Option<usize>,
+    max_order: Option<usize>,
+    dim: Option<usize>,
+    layer: Option<usize>,
+    storage: Option<MemoryStorage>,
+    no_gate: bool,
+    no_conv: bool,
+    table_std: Option<f64>,
+    lr_scale: Option<f64>,
+}
+
+impl MemoryOptions {
+    fn dims(&self, width: usize) -> MemoryDims {
+        let engram = MemoryDims::engram(width, self.rows);
+        MemoryDims {
+            heads: self.heads.unwrap_or(engram.heads),
+            max_order: self.max_order.unwrap_or(engram.max_order),
+            dim: self.dim.unwrap_or(engram.dim),
+            layer: self.layer.unwrap_or(engram.layer),
+            storage: self.storage.unwrap_or(engram.storage),
+            gate: !self.no_gate,
+            conv: !self.no_conv,
+            table_std: self.table_std.unwrap_or(engram.table_std),
+            lr_scale: self.lr_scale.unwrap_or(engram.lr_scale),
+            ..engram
+        }
+    }
 }
 
 /// Le backend du processeur choisi par `--cpu`.
@@ -186,6 +236,7 @@ impl Options {
             context: None,
             passes: 1,
             own_keys: None,
+            memory: None,
             resume: false,
             mixed: false,
             cpu: None,
@@ -267,6 +318,41 @@ impl Options {
                         early_weight,
                         late_weight,
                     });
+                }
+                "--memory" => options.memory.get_or_insert_default().rows = args.value(&flag)?,
+                "--memory-heads" => {
+                    options.memory.get_or_insert_default().heads = Some(args.value(&flag)?)
+                }
+                "--memory-order" => {
+                    options.memory.get_or_insert_default().max_order = Some(args.value(&flag)?)
+                }
+                "--memory-dim" => {
+                    options.memory.get_or_insert_default().dim = Some(args.value(&flag)?)
+                }
+                "--memory-layer" => {
+                    options.memory.get_or_insert_default().layer = Some(args.value(&flag)?)
+                }
+                "--memory-storage" => {
+                    options.memory.get_or_insert_default().storage =
+                        Some(match args.value::<String>(&flag)?.as_str() {
+                            "dense" => MemoryStorage::Dense,
+                            "sparse" => MemoryStorage::Sparse,
+                            "host" => MemoryStorage::Host,
+                            other => {
+                                return Err(format!(
+                                    "--memory-storage : `{other}` inconnu (dense, sparse ou host)"
+                                )
+                                .into());
+                            }
+                        })
+                }
+                "--memory-no-gate" => options.memory.get_or_insert_default().no_gate = true,
+                "--memory-no-conv" => options.memory.get_or_insert_default().no_conv = true,
+                "--memory-std" => {
+                    options.memory.get_or_insert_default().table_std = Some(args.value(&flag)?)
+                }
+                "--memory-lr-scale" => {
+                    options.memory.get_or_insert_default().lr_scale = Some(args.value(&flag)?)
                 }
                 "--resume" => options.resume = true,
                 "--mixed" => options.mixed = true,
@@ -384,6 +470,12 @@ impl Options {
         if let Some(context) = self.context {
             config.context = context;
         }
+        if let Some(memory) = &self.memory {
+            if memory.rows == 0 {
+                return Err("les options --memory-… demandent --memory LIGNES".into());
+            }
+            config.architecture.memory = Some(memory.dims(config.embed));
+        }
         config.validate()?;
         Ok(config)
     }
@@ -422,6 +514,12 @@ impl Options {
                 architecture.multi_token.map_or("aucun".to_string(), |m| {
                     format!("{} puis {}", m.early_weight, m.late_weight)
                 }),
+            ),
+            (
+                "run.memory",
+                architecture
+                    .memory
+                    .map_or("aucune".to_string(), |m| format!("{m:?}")),
             ),
         ]
         .into_iter()
@@ -595,11 +693,31 @@ fn run<B: Backend>(backend: &B, options: &Options, corpus: &Corpus) -> Result<()
             multi_token.early_weight, multi_token.late_weight
         );
     }
+    // Les paramètres du réseau, ceux qui calculent ; la table de la
+    // mémoire est comptée à part.
+    let mut parameters = model.parameter_count(backend);
+    if let Some(memory) = model.memory() {
+        let dims = memory.dims();
+        if dims.storage != MemoryStorage::Host {
+            parameters -= memory.table_parameters();
+        }
+        println!(
+            "mémoire de n-grammes : {} paramètres de table, {} tables de {} lignes et plus, \
+             ordres 2 à {}, d_mém {}, avant la couche {}{}{}, table {:?}",
+            memory.table_parameters(),
+            memory.hash().tables(),
+            dims.rows,
+            dims.max_order,
+            dims.dim,
+            dims.layer,
+            if dims.gate { ", porte" } else { "" },
+            if dims.conv { ", convolution" } else { "" },
+            dims.storage,
+        );
+    }
     println!(
         "{} paramètres, vocabulaire de {} tokens ({:.3} octets par token)",
-        model.parameter_count(backend),
-        config.vocab,
-        corpus.bytes_per_token,
+        parameters, config.vocab, corpus.bytes_per_token,
     );
     println!(
         "{} tokens d'entraînement dans {} fichier(s), {} de validation",

@@ -11,6 +11,7 @@ pub mod gpt2;
 pub mod io;
 pub mod mlp;
 pub mod model;
+pub mod ngram;
 pub mod nn;
 pub mod optim;
 pub mod post_training;

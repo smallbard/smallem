@@ -24,11 +24,12 @@ use std::time::Instant;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 
-use super::step::{evaluate, train_step_accumulated};
+use super::step::{clip_scale, evaluate, train_step_observed};
 use crate::backend::{Backend, Float};
 use crate::data::Batches;
 use crate::io::{SafeTensors, load_checkpoint, save_checkpoint, save_model};
 use crate::model::Gpt;
+use crate::nn::MemoryStorage;
 use crate::optim::{AnyOptimizer, Optimizer, OptimizerKind, cosine_schedule};
 
 /// Graine des lots de validation. Elle ne dépend pas de la graine de
@@ -324,6 +325,22 @@ impl<B: Backend, D: Batches> Trainer<'_, B, D> {
         let mut first_step = 0;
         let mut best = f64::INFINITY;
 
+        if let Some(memory) = model.memory()
+            && memory.dims().storage != MemoryStorage::Dense
+        {
+            if resume {
+                return Err(
+                    "une mémoire creuse ne reprend pas : ses moments ne sont pas \
+                            enregistrés"
+                        .into(),
+                );
+            }
+            if settings.accumulate > 1 {
+                return Err(
+                    "une mémoire creuse ne cumule pas les gradients de plusieurs lots".into(),
+                );
+            }
+        }
         if resume {
             let file = SafeTensors::read(&checkpoint)?;
             // Les réglages d'abord : un point de reprise qui n'est pas le
@@ -378,7 +395,7 @@ impl<B: Backend, D: Batches> Trainer<'_, B, D> {
                     .batch(&mut rng, settings.batch_size, config.context)?;
                 batches.push(batch.examples());
             }
-            let (loss, grad_norm) = train_step_accumulated(
+            let (loss, grad_norm) = train_step_observed(
                 backend,
                 model,
                 &mut optimizer,
@@ -388,7 +405,13 @@ impl<B: Backend, D: Batches> Trainer<'_, B, D> {
                     let (tokens, targets) = &batches[index];
                     m.training_loss(t, tokens, targets, settings.batch_size)
                 },
+                |m, tape, grads| m.collect_memory_gradient(tape, grads),
             );
+            // Les lignes lues de la mémoire font leur pas à part, écrêtées
+            // comme le reste ; leur gradient n'entre pas dans la norme.
+            if let Some(scale) = clip_scale(grad_norm, settings.max_grad_norm) {
+                model.apply_memory_gradient(backend, learning_rate, scale);
+            }
             // L'écrêtage a déjà synchronisé le GPU pour lire la norme : lire
             // la perte en plus ne coûte presque rien.
             let loss = backend.item(&loss).to_f64();
