@@ -10,7 +10,7 @@ use parquet::record::RowAccessor;
 use parquet::schema::types::Type;
 
 /// Un document sur `VAL_EVERY` part en validation, soit 5 %.
-pub const VAL_EVERY: u64 = 20;
+const VAL_EVERY: u64 = 20;
 
 /// Le découpage se fait par document entier, jamais au milieu d'un texte,
 /// et ne dépend que du rang du document dans son fichier : il est le même

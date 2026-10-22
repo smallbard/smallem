@@ -25,7 +25,7 @@ use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use smallem::cli::Args;
+use smallem::cli::{self, Args};
 use smallem::corpus::{ParquetTexts, is_validation};
 use smallem::tokenizer::{Bpe, END_OF_DOCUMENT, Encoder};
 
@@ -55,10 +55,7 @@ impl Options {
                 "--tokenizer" => options.tokenizer = Some(args.value(&arg)?),
                 "--out" => options.out_dir = Some(args.value(&arg)?),
                 "--limit-mb" => options.limit_mb = Some(args.value(&arg)?),
-                other if other.starts_with("--") => {
-                    return Err(format!("option inconnue : {other}").into());
-                }
-                input => options.inputs.push(input.into()),
+                input => options.inputs.push(cli::positional(input)?.into()),
             }
         }
         if options.inputs.is_empty() {

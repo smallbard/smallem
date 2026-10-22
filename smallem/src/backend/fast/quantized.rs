@@ -158,7 +158,7 @@ impl Fast {
         if m > ROWS || width != k || !format.group(k).is_multiple_of(2) {
             return None;
         }
-        let mut out = Buffer::uninit(m * n);
+        let mut out = Buffer::any(m * n);
         if self.int8_activations && super::vnni::available() {
             let packed = self.packed.get(words, || {
                 super::vnni::Packed::new(format, k, n, words.data(), scales.data())
@@ -210,24 +210,11 @@ fn product(fast: &Fast, w: &Native, x: &[f32], m: usize, out: &mut [f32]) {
     let slices = TASKS.div_ceil(blocks).min(groups).max(1);
     let per_slice = groups.div_ceil(slices);
     let slices = groups.div_ceil(per_slice);
-    let mut partial = if slices > 1 {
-        vec![0.0f32; (slices - 1) * m * n]
-    } else {
-        Vec::new()
-    };
-    let first_out = SharedMut::new(out);
-    let rest = SharedMut::new(&mut partial);
     let isa = fast.isa();
-    fast.pool().run(blocks * slices, |task| {
-        let (slice, block) = (task / blocks, task % blocks);
+    super::gemm::split_k(fast.pool(), out, slices, blocks, |slice, block, target| {
         let start = block * COLUMNS;
         let width = COLUMNS.min(n - start);
         let groups = slice * per_slice..groups.min((slice + 1) * per_slice);
-        let target = if slice == 0 {
-            first_out
-        } else {
-            unsafe { SharedMut::from_ptr(rest.ptr((slice - 1) * m * n)) }
-        };
         for row in (0..m).step_by(4) {
             let rows = 4.min(m - row);
             let job = Job {
@@ -242,6 +229,8 @@ fn product(fast: &Fast, w: &Native, x: &[f32], m: usize, out: &mut [f32]) {
             };
             match isa {
                 #[cfg(target_arch = "x86_64")]
+                // SAFETY : `fast.isa()` a été vérifiée à la construction du
+                // backend ; le bloc écrit ses lignes et ses colonnes.
                 Isa::Avx512 => unsafe {
                     match rows {
                         1 => x86::block::<1>(job),
@@ -254,11 +243,6 @@ fn product(fast: &Fast, w: &Native, x: &[f32], m: usize, out: &mut [f32]) {
             }
         }
     });
-    for part in partial.chunks(m * n) {
-        for (value, &x) in out.iter_mut().zip(part) {
-            *value += x;
-        }
-    }
 }
 
 /// Un bloc à calculer : `rows` lignes de `x` à partir de `row`, `width`
@@ -272,7 +256,7 @@ struct Job<'a> {
     start: usize,
     width: usize,
     groups: std::ops::Range<usize>,
-    out: SharedMut<f32>,
+    out: SharedMut<'a, f32>,
 }
 
 impl Native {
@@ -308,6 +292,7 @@ fn portable(job: Job) {
     } = job;
     let k = w.rows;
     for r in row..row + rows {
+        // SAFETY : chaque tâche écrit ses propres colonnes.
         let target = unsafe { out.slice(r * w.cols + start, width) };
         target.fill(0.0);
         for g in groups.clone() {
@@ -357,6 +342,9 @@ mod x86 {
         for g in groups {
             let (first, last) = (g * w.group, k.min((g + 1) * w.group));
             let mut acc = [[_mm512_setzero_ps(); V]; R];
+            // SAFETY : les groupes, les lignes et les colonnes lus existent
+            // (formes vérifiées par l'appelant) ; les colonnes masquées ne
+            // sont pas lues.
             unsafe {
                 match w.format {
                     Format::Int8 => {
@@ -415,6 +403,8 @@ mod x86 {
             }
         }
         for (r, sums) in total.iter().enumerate() {
+            // SAFETY : les colonnes masquées ne sont pas écrites ; chaque
+            // tâche écrit ses propres colonnes.
             unsafe {
                 let target = out.ptr((row + r) * n + start);
                 for (v, &mask) in masks.iter().enumerate() {

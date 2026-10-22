@@ -46,11 +46,12 @@ impl Default for Sampling {
     }
 }
 
-/// Indice du plus grand élément.
-fn argmax(values: &[f64]) -> usize {
+/// Indice du plus grand élément ; le premier, en cas d'égalité, comme
+/// pour le tirage glouton.
+pub(crate) fn argmax<T: PartialOrd>(values: &[T]) -> usize {
     let mut best = 0;
-    for (index, &value) in values.iter().enumerate() {
-        if value > values[best] {
+    for (index, value) in values.iter().enumerate() {
+        if *value > values[best] {
             best = index;
         }
     }
@@ -111,7 +112,7 @@ pub fn probabilities(logits: &[f64], sampling: &Sampling) -> Vec<f64> {
 }
 
 /// Tire un token à partir des logits du modèle.
-pub fn sample_logits(rng: &mut impl Rng, logits: &[f64], sampling: &Sampling) -> usize {
+pub(crate) fn sample_logits(rng: &mut impl Rng, logits: &[f64], sampling: &Sampling) -> usize {
     sample(rng, &probabilities(logits, sampling))
 }
 

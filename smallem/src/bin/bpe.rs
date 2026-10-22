@@ -14,7 +14,7 @@ use std::error::Error;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use smallem::cli::Args;
+use smallem::cli::{self, Args};
 use smallem::corpus::{ParquetTexts, is_validation};
 use smallem::tokenizer::{Bpe, FIRST_MERGE, count_words};
 
@@ -39,10 +39,7 @@ impl Options {
                 "--vocab" => options.vocab = args.value(&arg)?,
                 "--text-mb" => options.text_mb = args.value(&arg)?,
                 "--out" => options.out = args.value(&arg)?,
-                other if other.starts_with("--") => {
-                    return Err(format!("option inconnue : {other}").into());
-                }
-                input => options.input = input.into(),
+                input => options.input = cli::positional(input)?.into(),
             }
         }
         if !(FIRST_MERGE as usize..=u16::MAX as usize + 1).contains(&options.vocab) {

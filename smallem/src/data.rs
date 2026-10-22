@@ -54,6 +54,9 @@ impl Batches for Dataset {
     }
 
     fn batch(&self, rng: &mut impl Rng, batch_size: usize, context: usize) -> io::Result<Batch> {
+        if self.tokens.len() <= context {
+            return Err(too_short(self.tokens.len(), context + 1));
+        }
         Ok(self.sample_batch(rng, batch_size, context))
     }
 }
@@ -99,16 +102,27 @@ impl Dataset {
         self.tokens.is_empty()
     }
 
+    /// Vérifie que chaque token est dans un vocabulaire de `vocab` tokens :
+    /// sinon, le corpus et le modèle ne vont pas ensemble.
+    pub fn check_vocab(&self, vocab: usize) -> io::Result<()> {
+        check_tokens(&self.tokens, vocab)
+    }
+
     /// Tire `batch_size` fenêtres de `context + 1` tokens à des positions
     /// aléatoires, indépendantes les unes des autres. Une fenêtre peut
     /// chevaucher une frontière de document : le token de fin de document
     /// fait alors partie de la séquence, comme n'importe quel autre.
+    ///
+    /// # Panics
+    ///
+    /// Si le corpus est plus court qu'une fenêtre. [`Batches::batch`] rend
+    /// alors une erreur.
     pub fn sample_batch(&self, rng: &mut impl Rng, batch_size: usize, context: usize) -> Batch {
         let window = context + 1;
         assert!(
             self.tokens.len() >= window,
-            "le corpus ({} tokens) est plus court qu'une fenêtre ({window})",
-            self.tokens.len(),
+            "{}",
+            too_short(self.tokens.len(), window),
         );
         // Dernier départ possible : celui dont la fenêtre finit au dernier token.
         let last_start = self.tokens.len() - window;
@@ -234,10 +248,12 @@ impl Shards {
         // Nombre de départs valides dans chaque fichier.
         let starts = |shard: &Shard| (shard.tokens + 1).saturating_sub(window);
         let total: usize = self.shards.iter().map(starts).sum();
-        assert!(
-            total > 0,
-            "aucun fichier n'est assez long pour une fenêtre de {window} tokens",
-        );
+        if total == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("aucun fichier n'est assez long pour une fenêtre de {window} tokens"),
+            ));
+        }
 
         let mut inputs = Vec::with_capacity(batch_size * context);
         let mut targets = Vec::with_capacity(batch_size * context);
@@ -260,6 +276,45 @@ impl Shards {
             context,
         })
     }
+
+    /// Vérifie que chaque token de chaque fichier est dans un vocabulaire
+    /// de `vocab` tokens. Les fichiers sont lus en entier, par morceaux :
+    /// à faire une fois, à l'ouverture, quand le doute est permis.
+    pub fn check_vocab(&self, vocab: usize) -> io::Result<()> {
+        self.for_each_chunk(|tokens| check_tokens(tokens, vocab))
+    }
+
+    /// Passe tous les tokens à `visit`, fichier par fichier, par morceaux
+    /// d'un million : sans charger le corpus en entier.
+    fn for_each_chunk(&self, mut visit: impl FnMut(&[u16]) -> io::Result<()>) -> io::Result<()> {
+        const CHUNK: usize = 1 << 20;
+        for shard in 0..self.shard_count() {
+            let len = self.shard_len(shard);
+            for start in (0..len).step_by(CHUNK) {
+                visit(&self.read(shard, start, CHUNK.min(len - start))?)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// L'erreur d'un corpus de `len` tokens, plus court qu'une fenêtre.
+fn too_short(len: usize, window: usize) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!("le corpus ({len} tokens) est plus court qu'une fenêtre ({window})"),
+    )
+}
+
+/// Une erreur si un token de `tokens` sort d'un vocabulaire de `vocab`.
+fn check_tokens(tokens: &[u16], vocab: usize) -> io::Result<()> {
+    match tokens.iter().find(|&&token| token as usize >= vocab) {
+        Some(token) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("token {token} hors du vocabulaire de {vocab} tokens"),
+        )),
+        None => Ok(()),
+    }
 }
 
 /// Octets de texte par token d'un corpus, mesuré en relisant chaque token
@@ -270,25 +325,18 @@ impl Shards {
 /// du vocabulaire est une erreur : le corpus et le tokeniseur ne vont pas
 /// ensemble.
 pub fn bytes_per_token(shards: &Shards, tokenizer: &crate::tokenizer::Bpe) -> io::Result<f64> {
-    const CHUNK: usize = 1 << 20;
     if shards.is_empty() {
         return Err(io::Error::other("corpus vide"));
     }
     let mut bytes = 0usize;
-    for shard in 0..shards.shard_count() {
-        let len = shards.shard_len(shard);
-        for start in (0..len).step_by(CHUNK) {
-            for token in shards.read(shard, start, CHUNK.min(len - start))? {
-                if token as usize >= tokenizer.vocab_size() {
-                    return Err(io::Error::other(format!(
-                        "token {token} hors du vocabulaire de {} tokens",
-                        tokenizer.vocab_size(),
-                    )));
-                }
-                bytes += tokenizer.token_bytes(token).len();
-            }
-        }
-    }
+    shards.for_each_chunk(|tokens| {
+        check_tokens(tokens, tokenizer.vocab_size())?;
+        bytes += tokens
+            .iter()
+            .map(|&token| tokenizer.token_bytes(token).len())
+            .sum::<usize>();
+        Ok(())
+    })?;
     Ok(bytes as f64 / shards.len() as f64)
 }
 
@@ -466,6 +514,38 @@ mod tests {
         // deux dans le troisième : tous sont atteints, et eux seuls.
         let expected: Vec<u16> = vec![0, 1, 2, 3, 4, 5, 200, 201];
         assert_eq!(first_tokens.into_iter().collect::<Vec<_>>(), expected);
+    }
+
+    #[test]
+    fn a_corpus_too_short_is_an_error_when_drawing_through_batches() {
+        let error = counting(4)
+            .batch(&mut StdRng::seed_from_u64(0), 1, 4)
+            .err()
+            .unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        let dir = shard_dir("short", &[("train.bin", vec![1, 2, 3])]);
+        let shards = Shards::open_dir(&dir, "train.bin").unwrap();
+        let error = shards
+            .sample_batch(&mut StdRng::seed_from_u64(0), 1, 4)
+            .err()
+            .unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn tokens_outside_the_vocabulary_are_found() {
+        assert!(counting(10).check_vocab(10).is_ok());
+        assert!(counting(10).check_vocab(9).is_err());
+        let dir = shard_dir(
+            "vocab",
+            &[("a.train.bin", vec![1, 2]), ("b.train.bin", vec![3, 300])],
+        );
+        let shards = Shards::open_dir(&dir, "train.bin").unwrap();
+        let (fits, overflows) = (shards.check_vocab(301), shards.check_vocab(300));
+        fs::remove_dir_all(&dir).unwrap();
+        assert!(fits.is_ok());
+        assert_eq!(overflows.unwrap_err().kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]

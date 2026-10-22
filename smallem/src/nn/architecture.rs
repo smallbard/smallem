@@ -174,7 +174,7 @@ impl ExpertDims {
     /// traverse trois experts, donc autant de paramètres qu'avant.
     pub fn for_model(embed: usize) -> Self {
         let (shared, active) = (1, 2);
-        let reference = (8 * embed).div_ceil(3).next_multiple_of(8);
+        let reference = super::swiglu_hidden(embed);
         Self {
             shared,
             routed: 8,
@@ -224,11 +224,18 @@ pub enum Balance {
 }
 
 impl Balance {
+    /// Les noms des variantes, sur la ligne de commande et dans un fichier
+    /// de poids.
+    pub const NONE: &str = "none";
+    pub const BIAS: &str = "bias";
+    pub const LOSS: &str = "loss";
+    pub const NAMES: [&str; 3] = [Self::NONE, Self::BIAS, Self::LOSS];
+
     pub fn name(self) -> &'static str {
         match self {
-            Self::None => "none",
-            Self::Bias { .. } => "bias",
-            Self::Loss { .. } => "loss",
+            Self::None => Self::NONE,
+            Self::Bias { .. } => Self::BIAS,
+            Self::Loss { .. } => Self::LOSS,
         }
     }
 }
@@ -246,10 +253,16 @@ pub enum AttentionKind {
 }
 
 impl AttentionKind {
+    /// Les noms des variantes, sur la ligne de commande et dans un fichier
+    /// de poids.
+    pub const STANDARD: &str = "standard";
+    pub const LATENT: &str = "mla";
+    pub const NAMES: [&str; 2] = [Self::STANDARD, Self::LATENT];
+
     pub fn name(self) -> &'static str {
         match self {
-            Self::Standard => "standard",
-            Self::Latent(_) => "mla",
+            Self::Standard => Self::STANDARD,
+            Self::Latent(_) => Self::LATENT,
         }
     }
 }
@@ -316,6 +329,8 @@ macro_rules! named_choices {
         }
     };
 }
+
+pub(crate) use named_choices;
 
 named_choices! {
     /// La normalisation à l'entrée de chaque sous-couche.

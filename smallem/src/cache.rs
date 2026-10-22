@@ -31,8 +31,7 @@ pub const PAGE_SIZE: usize = 16;
 pub struct SequenceId(usize);
 
 /// Ce que le cache sait d'une séquence.
-#[derive(Clone, Debug, Default)]
-struct Sequence {
+struct Sequence<T> {
     /// Ses pages, dans l'ordre des positions.
     pages: Vec<u32>,
     /// Rang, dans la première page, de la plus ancienne position gardée.
@@ -43,9 +42,35 @@ struct Sequence {
     /// Position du prochain token dans la séquence. Elle dépasse `len` dès
     /// que des positions ont été oubliées.
     next_position: usize,
-    /// Ses derniers tokens, du plus ancien au plus récent : les n-grammes
-    /// de la mémoire du modèle, s'il en a une, en ont besoin.
+    /// Ce qu'en garde la mémoire de n-grammes du modèle, s'il en a une.
+    ngram: NgramState<T>,
+}
+
+impl<T> Sequence<T> {
+    fn new() -> Self {
+        Self {
+            pages: Vec::new(),
+            start: 0,
+            len: 0,
+            next_position: 0,
+            ngram: NgramState {
+                recent: Vec::new(),
+                rows: None,
+            },
+        }
+    }
+}
+
+/// Ce que la mémoire de n-grammes garde d'une séquence. Elle ne lit pas
+/// les tables : ses n-grammes et sa convolution ne regardent que quelques
+/// positions en arrière, qu'elle garde à part.
+struct NgramState<T> {
+    /// Les derniers tokens, du plus ancien au plus récent : les n-grammes
+    /// des suivants en ont besoin.
     recent: Vec<u32>,
+    /// Les dernières entrées de la convolution, `[lignes, C]` ; `None`
+    /// avant la première passe.
+    rows: Option<T>,
 }
 
 /// Le cache de génération de toutes les séquences en cours.
@@ -58,10 +83,11 @@ pub struct KvCache<B: Backend> {
     /// Les pages libres ; la prochaine donnée est la dernière.
     free: Vec<u32>,
     /// Indexé par [`SequenceId`] ; `None` pour une séquence terminée.
-    sequences: Vec<Option<Sequence>>,
-    /// Indexé par [`SequenceId`] : les dernières entrées de la convolution
-    /// de la mémoire de n-grammes, s'il y en a une.
-    memory_rows: Vec<Option<B::Tensor>>,
+    sequences: Vec<Option<Sequence<B::Tensor>>>,
+    /// Nombre de positions sur lesquelles une séquence peut revenir
+    /// ([`KvCache::truncate`]) quand le modèle a une mémoire de n-grammes :
+    /// elle garde d'autant plus de son passé.
+    rollback: usize,
 }
 
 impl<B: Backend> KvCache<B> {
@@ -85,7 +111,7 @@ impl<B: Backend> KvCache<B> {
             pages,
             free: (0..pages as u32).rev().collect(),
             sequences: Vec::new(),
-            memory_rows: Vec::new(),
+            rollback: 0,
         }
     }
 
@@ -121,50 +147,64 @@ impl<B: Backend> KvCache<B> {
         if index == self.sequences.len() {
             self.sequences.push(None);
         }
-        self.sequences[index] = Some(Sequence::default());
+        self.sequences[index] = Some(Sequence::new());
         SequenceId(index)
     }
 
-    /// Les dernières entrées de la convolution de la mémoire pour la
-    /// séquence `id`, `[≤ 9, C]`, ou `None` avant sa première passe.
-    pub fn memory_rows(&self, id: SequenceId) -> Option<&B::Tensor> {
-        self.memory_rows.get(id.0)?.as_ref()
+    /// Permet aux séquences de revenir de `positions` positions en arrière
+    /// ([`KvCache::truncate`]) même quand le modèle a une mémoire de
+    /// n-grammes : elle garde alors `positions` tokens et entrées de plus.
+    /// Le réglage vaut pour ce que les passes suivantes gardent.
+    pub fn set_rollback(&mut self, positions: usize) {
+        self.rollback = positions;
     }
 
-    pub fn set_memory_rows(&mut self, id: SequenceId, rows: B::Tensor) {
-        if self.memory_rows.len() <= id.0 {
-            self.memory_rows.resize_with(id.0 + 1, || None);
-        }
-        self.memory_rows[id.0] = Some(rows);
+    /// Les dernières entrées de la convolution de la mémoire pour la
+    /// séquence `id`, `[lignes, C]`, ou `None` avant sa première passe.
+    pub fn memory_rows(&self, id: SequenceId) -> Option<&B::Tensor> {
+        self.sequence(id).ngram.rows.as_ref()
+    }
+
+    /// Garde les entrées `rows` de la convolution de la mémoire, `[lignes,
+    /// C]`, celles des dernières positions de la séquence `id` : les `keep`
+    /// dernières, plus de quoi revenir en arrière.
+    pub fn set_memory_rows(&mut self, backend: &B, id: SequenceId, rows: B::Tensor, keep: usize) {
+        let total = backend.shape(&rows)[0];
+        let kept = (keep + self.rollback).min(total);
+        let rows = if kept == total {
+            rows
+        } else {
+            let last: Vec<u32> = (total - kept..total).map(|r| r as u32).collect();
+            backend.gather_rows(&rows, &last)
+        };
+        self.sequence_mut(id).ngram.rows = Some(rows);
     }
 
     /// Termine une séquence : ses pages retournent à la réserve.
     pub fn remove_sequence(&mut self, id: SequenceId) {
-        if let Some(rows) = self.memory_rows.get_mut(id.0) {
-            *rows = None;
-        }
         let sequence = self.sequences[id.0].take().expect("séquence déjà terminée");
         self.free.extend(sequence.pages.iter().rev());
     }
 
-    fn sequence(&self, id: SequenceId) -> &Sequence {
+    fn sequence(&self, id: SequenceId) -> &Sequence<B::Tensor> {
         self.sequences[id.0].as_ref().expect("séquence terminée")
     }
 
-    fn sequence_mut(&mut self, id: SequenceId) -> &mut Sequence {
+    fn sequence_mut(&mut self, id: SequenceId) -> &mut Sequence<B::Tensor> {
         self.sequences[id.0].as_mut().expect("séquence terminée")
     }
 
     /// Les derniers tokens de la séquence `id`, du plus ancien au plus
     /// récent : ceux que [`KvCache::remember`] a gardés.
     pub fn recent(&self, id: SequenceId) -> &[u32] {
-        &self.sequence(id).recent
+        &self.sequence(id).ngram.recent
     }
 
     /// Ajoute `tokens` aux derniers tokens de la séquence `id`, et n'en
-    /// garde que les `keep` plus récents.
+    /// garde que les `keep` plus récents, plus de quoi revenir en arrière.
     pub fn remember(&mut self, id: SequenceId, tokens: &[u32], keep: usize) {
-        let recent = &mut self.sequence_mut(id).recent;
+        let keep = keep + self.rollback;
+        let recent = &mut self.sequence_mut(id).ngram.recent;
         recent.extend_from_slice(tokens);
         let excess = recent.len().saturating_sub(keep);
         recent.drain(..excess);
@@ -206,7 +246,7 @@ impl<B: Backend> KvCache<B> {
 
     /// La ligne des tables où est rangée la position gardée de rang `rank`
     /// (0 pour la plus ancienne) de `sequence`.
-    fn line(&self, sequence: &Sequence, rank: usize) -> u32 {
+    fn line(&self, sequence: &Sequence<B::Tensor>, rank: usize) -> u32 {
         let index = sequence.start + rank;
         sequence.pages[index / self.page_size] * self.page_size as u32
             + (index % self.page_size) as u32
@@ -232,14 +272,36 @@ impl<B: Backend> KvCache<B> {
     /// Ramène la séquence `id` à ses `len` premières positions gardées,
     /// comme si les suivantes n'avaient jamais été écrites : le décodage
     /// spéculatif revient ainsi sur les propositions refusées.
-    pub fn truncate(&mut self, id: SequenceId, len: usize) {
-        let page_size = self.page_size;
+    ///
+    /// Ce que garde la mémoire de n-grammes recule aussi. Elle ne garde que
+    /// quelques positions : avec elle, on ne revient que du nombre de
+    /// positions réglé par [`KvCache::set_rollback`].
+    pub fn truncate(&mut self, backend: &B, id: SequenceId, len: usize) {
+        let (page_size, rollback) = (self.page_size, self.rollback);
         let sequence = self.sequence_mut(id);
         assert!(
             len <= sequence.len,
             "on ne peut que raccourcir une séquence"
         );
-        sequence.next_position -= sequence.len - len;
+        let removed = sequence.len - len;
+        let ngram = &mut sequence.ngram;
+        if ngram.rows.is_some() || !ngram.recent.is_empty() {
+            assert!(
+                removed <= rollback,
+                "la mémoire de n-grammes ne revient que de {rollback} positions, \
+                 {removed} demandées"
+            );
+            let recent = ngram.recent.len();
+            ngram.recent.truncate(recent.saturating_sub(removed));
+        }
+        if let Some(rows) = ngram.rows.take() {
+            let total = backend.shape(&rows)[0];
+            if total > removed {
+                let first: Vec<u32> = (0..(total - removed) as u32).collect();
+                ngram.rows = Some(backend.gather_rows(&rows, &first));
+            }
+        }
+        sequence.next_position -= removed;
         sequence.len = len;
         let kept = (sequence.start + len).div_ceil(page_size).max(1);
         let freed: Vec<u32> = sequence
@@ -484,7 +546,7 @@ mod tests {
         assert_eq!(cache.free_pages(), 2);
         // Revenir en arrière recule aussi la prochaine position, et rend
         // la page devenue vide.
-        cache.truncate(id, 2);
+        cache.truncate(&Cpu::new(), id, 2);
         assert_eq!(lines(&cache, id), [4, 5]);
         assert_eq!((cache.len(id), cache.next_position(id)), (2, 6));
         assert_eq!(cache.free_pages(), 3);

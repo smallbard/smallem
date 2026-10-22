@@ -188,6 +188,7 @@ fn quantize_rows(w: &Packed, x: &[f32], m: usize) -> Activations {
 /// `out ≈ x · W`, `x` `[m, K]` et `out` `[m, N]`, découpé comme dans
 /// `quantized.rs`.
 pub(crate) fn product(fast: &Fast, w: &Packed, x: &[f32], m: usize, out: &mut [f32]) {
+    assert!(available(), "le processeur n'a pas les instructions VNNI");
     let n = w.cols;
     let activations = quantize_rows(w, x, m);
     let groups = w.padded.div_ceil(w.group);
@@ -195,23 +196,10 @@ pub(crate) fn product(fast: &Fast, w: &Packed, x: &[f32], m: usize, out: &mut [f
     let slices = BLOCK_TASKS.div_ceil(blocks).min(groups).max(1);
     let per_slice = groups.div_ceil(slices);
     let slices = groups.div_ceil(per_slice);
-    let mut partial = if slices > 1 {
-        vec![0.0f32; (slices - 1) * m * n]
-    } else {
-        Vec::new()
-    };
-    let first_out = SharedMut::new(out);
-    let rest = SharedMut::new(&mut partial);
-    fast.pool().run(blocks * slices, |task| {
-        let (slice, block) = (task / blocks, task % blocks);
+    super::gemm::split_k(fast.pool(), out, slices, blocks, |slice, block, target| {
         let start = block * BLOCK_COLUMNS;
         let width = BLOCK_COLUMNS.min(n - start);
         let groups = slice * per_slice..groups.min((slice + 1) * per_slice);
-        let target = if slice == 0 {
-            first_out
-        } else {
-            unsafe { SharedMut::from_ptr(rest.ptr((slice - 1) * m * n)) }
-        };
         for row in (0..m).step_by(4) {
             let job = Job {
                 w,
@@ -222,6 +210,8 @@ pub(crate) fn product(fast: &Fast, w: &Packed, x: &[f32], m: usize, out: &mut [f
                 groups: groups.clone(),
                 out: target,
             };
+            // SAFETY : `available()` est vérifiée ci-dessus ; le bloc écrit
+            // ses lignes et ses colonnes.
             #[cfg(target_arch = "x86_64")]
             unsafe {
                 match m - row {
@@ -235,11 +225,6 @@ pub(crate) fn product(fast: &Fast, w: &Packed, x: &[f32], m: usize, out: &mut [f
             let _ = job;
         }
     });
-    for part in partial.chunks(m * n) {
-        for (value, &x) in out.iter_mut().zip(part) {
-            *value += x;
-        }
-    }
 }
 
 struct Job<'a> {
@@ -249,7 +234,7 @@ struct Job<'a> {
     start: usize,
     width: usize,
     groups: std::ops::Range<usize>,
-    out: SharedMut<f32>,
+    out: SharedMut<'a, f32>,
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -285,6 +270,9 @@ mod x86 {
         for g in groups {
             let (first, last) = (g * w.group, w.padded.min((g + 1) * w.group));
             let mut acc = [[_mm512_setzero_si512(); V]; R];
+            // SAFETY : les groupes, les lignes et les colonnes lus existent
+            // (formes vérifiées par l'appelant) ; les colonnes masquées ne
+            // sont pas lues.
             unsafe {
                 match w.format {
                     Format::Int8 => {
@@ -353,6 +341,8 @@ mod x86 {
             }
         }
         for (r, sums) in total.iter().enumerate() {
+            // SAFETY : les colonnes masquées ne sont pas écrites ; chaque
+            // tâche écrit ses propres colonnes.
             unsafe {
                 let target = out.ptr((row + r) * n + start);
                 for (v, &mask) in masks.iter().enumerate() {

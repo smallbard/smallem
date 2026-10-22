@@ -22,6 +22,7 @@ use std::fs;
 
 use rand::SeedableRng;
 use rand::rngs::StdRng;
+use smallem::cli::{self, Args};
 use smallem::scaling::{
     LossLaw, Run, bootstrap, fit_loss_law, fit_parabola, fit_power_law, quantile,
 };
@@ -39,27 +40,50 @@ struct Row {
     loss: f64,
 }
 
+/// Les entraînements d'un fichier `results.tsv`. Une ligne illisible est
+/// une erreur ; un entraînement raté (perte `NaN`) est écarté et signalé.
 fn read(path: &str) -> Result<Vec<Row>, Box<dyn Error>> {
     let mut rows = Vec::new();
-    for line in fs::read_to_string(path)?.lines().skip(1) {
-        let fields: Vec<&str> = line.split('\t').collect();
-        let (Ok(parameters), Ok(flops), Ok(steps), Ok(loss)) = (
-            fields[1].parse::<f64>(),
-            fields[2].parse::<f64>(),
-            fields[3].parse::<f64>(),
-            fields[4].parse::<f64>(),
-        ) else {
+    let mut failed = Vec::new();
+    // Après l'en-tête, la première ligne est la ligne 2.
+    for (line_number, line) in (2..).zip(fs::read_to_string(path)?.lines().skip(1)) {
+        if line.trim().is_empty() {
             continue;
-        };
-        if loss.is_finite() {
-            rows.push(Row {
-                name: fields[0].to_string(),
-                parameters,
-                flops,
-                tokens: steps * TOKENS_PER_STEP,
-                loss,
-            });
         }
+        let fields: Vec<&str> = line.split('\t').collect();
+        let parsed = match fields[..] {
+            [name, parameters, flops, steps, loss, ..] => (|| {
+                Some((
+                    name,
+                    parameters.parse::<f64>().ok()?,
+                    flops.parse::<f64>().ok()?,
+                    steps.parse::<f64>().ok()?,
+                    loss.parse::<f64>().ok()?,
+                ))
+            })(),
+            _ => None,
+        };
+        let Some((name, parameters, flops, steps, loss)) = parsed else {
+            return Err(format!("{path}, ligne {line_number} illisible : `{line}`").into());
+        };
+        if !loss.is_finite() {
+            failed.push(name.to_string());
+            continue;
+        }
+        rows.push(Row {
+            name: name.to_string(),
+            parameters,
+            flops,
+            tokens: steps * TOKENS_PER_STEP,
+            loss,
+        });
+    }
+    if !failed.is_empty() {
+        eprintln!(
+            "{path} : {} entraînements ratés écartés ({})",
+            failed.len(),
+            failed.join(", ")
+        );
     }
     Ok(rows)
 }
@@ -92,15 +116,18 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut files = Vec::new();
     let (mut non_embedding, mut rounds) = (false, 200usize);
     let (mut predictions, mut checks) = (Vec::new(), Vec::new());
-    let mut args = std::env::args().skip(1);
+    let mut args = Args::from_env();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--non-embedding" => non_embedding = true,
-            "--predict" => predictions.push(args.next().ok_or("--predict C")?.parse::<f64>()?),
-            "--check" => checks.push(args.next().ok_or("--check NOM")?),
-            "--bootstrap" => rounds = args.next().ok_or("--bootstrap N")?.parse()?,
-            other => files.push(other.to_string()),
+            "--predict" => predictions.push(args.value::<f64>(&arg)?),
+            "--check" => checks.push(args.value::<String>(&arg)?),
+            "--bootstrap" => rounds = args.value(&arg)?,
+            file => files.push(cli::positional(file)?.to_string()),
         }
+    }
+    if files.is_empty() {
+        return Err("aucun fichier de résultats : fit [options] RÉSULTATS…".into());
     }
     let mut rows = Vec::new();
     for file in &files {

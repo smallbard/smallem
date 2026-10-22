@@ -129,7 +129,11 @@ impl<B: Backend> Parameter<B> {
         &self.value
     }
 
+    /// La valeur, à modifier sur place. Comme [`Parameter::set_value`],
+    /// cela oublie la feuille de la dernière tape : elle portait l'ancienne
+    /// valeur.
     pub fn value_mut(&mut self) -> &mut B::Tensor {
+        self.binding.set(None);
         &mut self.value
     }
 
@@ -336,6 +340,12 @@ pub trait Module<B: Backend> {
             .map(|p| backend.shape(p.value()).iter().product::<usize>())
             .sum()
     }
+
+    /// Garde, après la rétropropagation de la tape `tape`, les gradients
+    /// dont l'optimiseur ne verra rien : ceux des lignes lues d'une mémoire
+    /// de n-grammes creuse, qui apprend à part. Rien par défaut ; un module
+    /// fait de modules leur transmet l'appel.
+    fn collect_gradients(&mut self, _tape: u64, _grads: &Gradients<B>) {}
 }
 
 /// Nom d'un champ `name` dans un module nommé `prefix`.
@@ -380,6 +390,12 @@ impl<B: Backend, M: Module<B>> Module<B> for Vec<M> {
             module.walk_mut(&child_name(prefix, &index.to_string()), visitor);
         }
     }
+
+    fn collect_gradients(&mut self, tape: u64, grads: &Gradients<B>) {
+        for module in self {
+            module.collect_gradients(tape, grads);
+        }
+    }
 }
 
 /// Un module facultatif : absent, il n'a aucun paramètre.
@@ -399,6 +415,12 @@ impl<B: Backend, M: Module<B>> Module<B> for Option<M> {
             module.walk_mut(prefix, visitor);
         }
     }
+
+    fn collect_gradients(&mut self, tape: u64, grads: &Gradients<B>) {
+        if let Some(module) = self {
+            module.collect_gradients(tape, grads);
+        }
+    }
 }
 
 /// Un module en boîte se parcourt comme le module lui-même.
@@ -413,6 +435,10 @@ impl<B: Backend, M: Module<B>> Module<B> for Box<M> {
         visitor: &mut dyn FnMut(String, &'a mut Parameter<B>),
     ) {
         (**self).walk_mut(prefix, visitor);
+    }
+
+    fn collect_gradients(&mut self, tape: u64, grads: &Gradients<B>) {
+        (**self).collect_gradients(tape, grads);
     }
 }
 
@@ -456,6 +482,14 @@ macro_rules! module {
                     $crate::nn::Module::walk_mut(&mut self.$field, &name, visitor);
                 )+
             }
+
+            fn collect_gradients(
+                &mut self,
+                tape: u64,
+                grads: &$crate::autograd::Gradients<B>,
+            ) {
+                $($crate::nn::Module::collect_gradients(&mut self.$field, tape, grads);)+
+            }
         }
     };
     (enum $type:ident { $($variant:ident),+ $(,)? }) => {
@@ -478,6 +512,18 @@ macro_rules! module {
                 match self {
                     $(Self::$variant(inner) => {
                         $crate::nn::Module::walk_mut(inner, prefix, visitor)
+                    })+
+                }
+            }
+
+            fn collect_gradients(
+                &mut self,
+                tape: u64,
+                grads: &$crate::autograd::Gradients<B>,
+            ) {
+                match self {
+                    $(Self::$variant(inner) => {
+                        $crate::nn::Module::collect_gradients(inner, tape, grads)
                     })+
                 }
             }

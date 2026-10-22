@@ -12,7 +12,7 @@ use crate::autograd::Tape;
 use crate::backend::{Backend, Float};
 use crate::cache::{KvCache, SequenceId};
 use crate::model::Gpt;
-use crate::sampling::{Sampling, sample_logits};
+use crate::sampling::{Sampling, argmax, sample_logits};
 
 /// Une génération en cours.
 ///
@@ -399,18 +399,6 @@ impl<'a, B: Backend> Batch<'a, B> {
         }
         drawn
     }
-}
-
-/// Indice du plus grand élément ; le premier, en cas d'égalité, comme
-/// pour le tirage glouton.
-fn argmax<F: Float>(values: &[F]) -> usize {
-    let mut best = 0;
-    for (index, value) in values.iter().enumerate() {
-        if *value > values[best] {
-            best = index;
-        }
-    }
-    best
 }
 
 /// La dernière ligne de logits `[N, V]`, rapatriée sur l'hôte. Le modèle

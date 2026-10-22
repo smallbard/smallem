@@ -6,7 +6,7 @@ use std::cell::{Cell, RefCell};
 
 use rand::Rng;
 
-use super::{Balance, ExpertDims, Parameter, Projection, SwiGluFeedForward, module};
+use super::{Balance, ExpertDims, Parameter, Projection, SwiGluFeedForward, module, sigmoid};
 use crate::autograd::{Tape, Var};
 use crate::backend::{Backend, Float};
 
@@ -64,6 +64,8 @@ struct Load {
 impl<B: Backend> MixtureOfExperts<B> {
     /// `proj_std` est l'écart-type d'initialisation de la projection de
     /// sortie de chaque expert (voir [`Block::new`](super::Block::new)).
+    /// Des tailles refusées par [`ExpertDims::validate`] arrêtent le
+    /// programme : voir [`MixtureOfExperts::try_new`].
     pub fn new(
         backend: &B,
         dim: usize,
@@ -71,14 +73,24 @@ impl<B: Backend> MixtureOfExperts<B> {
         proj_std: f64,
         rng: &mut impl Rng,
     ) -> Self {
-        if let Err(error) = dims.validate() {
-            panic!("{error}");
-        }
+        Self::try_new(backend, dim, dims, proj_std, rng).unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    /// Comme [`MixtureOfExperts::new`], des tailles refusées étant une
+    /// erreur.
+    pub fn try_new(
+        backend: &B,
+        dim: usize,
+        dims: ExpertDims,
+        proj_std: f64,
+        rng: &mut impl Rng,
+    ) -> Result<Self, String> {
+        dims.validate()?;
         let mut expert =
             || SwiGluFeedForward::with_hidden(backend, dim, dims.hidden, proj_std, rng);
         let shared = (0..dims.shared).map(|_| expert()).collect();
         let experts = (0..dims.routed).map(|_| expert()).collect();
-        Self {
+        Ok(Self {
             dims,
             dense: false,
             shared,
@@ -90,7 +102,7 @@ impl<B: Backend> MixtureOfExperts<B> {
                 since_balance: vec![0; dims.routed],
             }),
             penalty: Cell::new(None),
-        }
+        })
     }
 
     pub fn dims(&self) -> ExpertDims {
@@ -317,12 +329,6 @@ module!(MixtureOfExperts {
     router,
     routing_bias
 });
-
-/// `1 / (1 + e^(-x))`, élément par élément.
-fn sigmoid<B: Backend>(tape: &Tape<B>, x: Var) -> Var {
-    let one = tape.scalar(B::Scalar::ONE);
-    tape.div(one, tape.add(one, tape.exp(tape.neg(x))))
-}
 
 /// Le résultat d'un aiguillage : qui va où.
 #[derive(Debug, PartialEq)]

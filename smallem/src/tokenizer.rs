@@ -15,6 +15,9 @@ pub const END_OF_DOCUMENT: u16 = 256;
 /// 256 octets + le token de fin de document.
 pub const VOCAB_SIZE: usize = 257;
 
+/// Le nom du fichier de fusions BPE, à côté des tokens qu'il a produits.
+pub const TOKENIZER_FILE: &str = "tokenizer.bpe";
+
 pub fn encode(text: &str) -> Vec<u16> {
     text.bytes().map(u16::from).collect()
 }
@@ -49,6 +52,9 @@ const CACHE_CAPACITY: usize = 1 << 20;
 
 /// Première ligne d'un fichier de fusions.
 const FILE_HEADER: &str = "smallem-bpe 1";
+
+/// Le numéro de la ligne de la première fusion, après l'en-tête.
+const FIRST_LINE: usize = 2;
 
 /// Une paire de tokens voisins.
 type Pair = (u16, u16);
@@ -119,7 +125,7 @@ fn first_word_len(text: &str) -> usize {
 /// `"Hello, world 42"` donne `"Hello"`, `","`, `" world"`, `" 42"`. Les
 /// autres blancs (retours à la ligne, espaces multiples) forment des mots à
 /// part.
-pub fn split_words(text: &str) -> impl Iterator<Item = &str> {
+fn split_words(text: &str) -> impl Iterator<Item = &str> {
     let mut rest = text;
     std::iter::from_fn(move || {
         if rest.is_empty() {
@@ -173,10 +179,19 @@ impl Bpe {
     /// peut assembler que des tokens qui existent déjà au moment où elle
     /// est apprise, et jamais le token de fin de document.
     pub fn from_merges(merges: Vec<Pair>) -> Result<Self, String> {
+        Self::checked(merges).map_err(|(index, reason)| match index {
+            Some(index) => format!("fusion {index} : {reason}"),
+            None => reason,
+        })
+    }
+
+    /// [`Bpe::from_merges`], dont l'erreur donne à part l'indice de la
+    /// fusion fautive : le fichier, lui, parle en lignes.
+    fn checked(merges: Vec<Pair>) -> Result<Self, (Option<usize>, String)> {
         if FIRST_MERGE as usize + merges.len() > u16::MAX as usize + 1 {
-            return Err(format!(
-                "{} fusions ne tiennent pas sur 16 bits",
-                merges.len()
+            return Err((
+                None,
+                format!("{} fusions ne tiennent pas sur 16 bits", merges.len()),
             ));
         }
         let mut token_bytes: Vec<Vec<u8>> = (0..=u8::MAX).map(|byte| vec![byte]).collect();
@@ -186,11 +201,11 @@ impl Bpe {
             let token = FIRST_MERGE + index as u16;
             for part in [left, right] {
                 if part >= token || part == END_OF_DOCUMENT {
-                    return Err(format!("fusion {index} : token {part} invalide"));
+                    return Err((Some(index), format!("token {part} invalide")));
                 }
             }
             if merged.insert((left, right), token).is_some() {
-                return Err(format!("fusion {index} : paire déjà fusionnée"));
+                return Err((Some(index), "paire déjà fusionnée".into()));
             }
             let mut bytes = token_bytes[left as usize].clone();
             bytes.extend_from_slice(&token_bytes[right as usize]);
@@ -371,13 +386,14 @@ impl Bpe {
     }
 
     /// Enregistre la table de fusions : une ligne d'en-tête, puis une ligne
-    /// `gauche droite` par fusion, dans l'ordre d'apprentissage.
+    /// `gauche droite` par fusion, dans l'ordre d'apprentissage. Comme les
+    /// poids, à côté puis renommée.
     pub fn save(&self, path: impl AsRef<Path>) -> io::Result<()> {
         let mut text = format!("{FILE_HEADER}\n");
         for (left, right) in &self.merges {
             text.push_str(&format!("{left} {right}\n"));
         }
-        fs::write(path, text)
+        crate::io::write_atomically(path, text.as_bytes())
     }
 
     pub fn load(path: impl AsRef<Path>) -> io::Result<Self> {
@@ -388,18 +404,21 @@ impl Bpe {
             return Err(invalid("ce n'est pas un fichier de fusions".into()));
         }
         let mut merges = Vec::new();
-        for (index, line) in lines.enumerate() {
+        for (line_number, line) in (FIRST_LINE..).zip(lines) {
             let parts: Vec<&str> = line.split(' ').collect();
             let (Ok(left), Ok(right), 2) = (
                 parts[0].parse(),
                 parts.get(1).unwrap_or(&"").parse(),
                 parts.len(),
             ) else {
-                return Err(invalid(format!("fusion {index} illisible : `{line}`")));
+                return Err(invalid(format!("ligne {line_number} illisible : `{line}`")));
             };
             merges.push((left, right));
         }
-        Self::from_merges(merges).map_err(invalid)
+        Self::checked(merges).map_err(|(index, reason)| match index {
+            Some(index) => invalid(format!("ligne {} : {reason}", index + FIRST_LINE)),
+            None => invalid(reason),
+        })
     }
 }
 
@@ -771,6 +790,15 @@ mod tests {
         for content in ["97 98\n", "smallem-bpe 1\n97\n", "smallem-bpe 1\n97 x\n"] {
             fs::write(&path, content).unwrap();
             assert!(Bpe::load(&path).is_err(), "{content:?}");
+        }
+        // L'erreur donne la ligne du fichier, en-tête compris.
+        for content in [
+            "smallem-bpe 1\n97 98\n97 x\n",
+            "smallem-bpe 1\n97 98\n97 98\n",
+        ] {
+            fs::write(&path, content).unwrap();
+            let error = Bpe::load(&path).unwrap_err().to_string();
+            assert!(error.starts_with("ligne 3 "), "{content:?} : {error}");
         }
         fs::remove_file(&path).unwrap();
     }

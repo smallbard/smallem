@@ -3,7 +3,7 @@
 
 use rand::Rng;
 
-use super::{Architecture, Block, Projection, RmsNorm, Rope, module};
+use super::{Block, BlockShape, Projection, RmsNorm, Rope, module};
 use crate::autograd::{Tape, Var};
 use crate::backend::Backend;
 use crate::cache::{AttentionCache, CacheStep};
@@ -33,21 +33,15 @@ pub struct MultiTokenHead<B: Backend> {
 }
 
 impl<B: Backend> MultiTokenHead<B> {
-    /// `layers` et `architecture` sont ceux du modèle principal : le bloc
-    /// du module est fait comme les siens.
-    pub fn new(
-        backend: &B,
-        dim: usize,
-        heads: usize,
-        layers: usize,
-        architecture: Architecture,
-        rng: &mut impl Rng,
-    ) -> Self {
+    /// `shape` est celle des blocs du modèle principal : le bloc du module
+    /// est fait comme les siens.
+    pub fn new(backend: &B, shape: BlockShape, rng: &mut impl Rng) -> Self {
+        let dim = shape.dim;
         Self {
             hidden_norm: RmsNorm::new(backend, dim),
             embedding_norm: RmsNorm::new(backend, dim),
             proj: Projection::new(backend, 2 * dim, dim, rng),
-            block: Block::new(backend, dim, heads, layers, architecture, false, rng),
+            block: Block::new(backend, shape, false, rng),
         }
     }
 
@@ -55,12 +49,8 @@ impl<B: Backend> MultiTokenHead<B> {
     /// les embeddings des tokens qui suivent, `[B, N, C]` tous les deux.
     /// Renvoie `[B, N, C]`, à passer dans la sortie du modèle principal.
     pub fn forward(&self, tape: &Tape<B>, hidden: Var, next: Var, rope: Option<Rope>) -> Var {
-        let joined = tape.concat(
-            self.hidden_norm.forward(tape, hidden),
-            self.embedding_norm.forward(tape, next),
-        );
-        self.block
-            .forward(tape, self.proj.forward(tape, joined), rope, None, &mut None)
+        let x = self.join(tape, hidden, next);
+        self.block.forward(tape, x, rope, None, &mut None)
     }
 
     /// La même chose en génération : `hidden` et `next` sont `[1, n, C]`,
@@ -74,13 +64,18 @@ impl<B: Backend> MultiTokenHead<B> {
         cache: &mut AttentionCache<B>,
         step: &CacheStep,
     ) -> Var {
+        let x = self.join(tape, hidden, next);
+        self.block
+            .forward(tape, x, None, Some((cache, step)), &mut None)
+    }
+
+    /// L'entrée du bloc : `[rms(h) ; rms(embedding(t))] · W`.
+    fn join(&self, tape: &Tape<B>, hidden: Var, next: Var) -> Var {
         let joined = tape.concat(
             self.hidden_norm.forward(tape, hidden),
             self.embedding_norm.forward(tape, next),
         );
-        let x = self.proj.forward(tape, joined);
-        self.block
-            .forward(tape, x, None, Some((cache, step)), &mut None)
+        self.proj.forward(tape, joined)
     }
 }
 

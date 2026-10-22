@@ -56,6 +56,12 @@ fn split_last_axis(tensor: &HostTensor, parts: usize) -> Vec<HostTensor> {
 /// `[entrée, sortie]`, comme [`Linear`](crate::nn::Linear). Ce serait
 /// différent avec la convention habituelle de PyTorch, `[sortie, entrée]`.
 pub fn convert(file: &SafeTensors, config: GptConfig) -> Result<SafeTensors, String> {
+    if config.architecture != Architecture::GPT2 {
+        return Err(format!(
+            "les poids de GPT-2 demandent l'architecture de GPT-2, pas {:?}",
+            config.architecture
+        ));
+    }
     let get = |name: &str| {
         file.tensors
             .get(name)
@@ -122,13 +128,10 @@ mod tests {
     use rand::SeedableRng;
     use rand::rngs::StdRng;
 
+    /// Le modèle minuscule des tests, avec deux blocs.
     const TINY: GptConfig = GptConfig {
-        vocab: 11,
-        context: 4,
         layers: 2,
-        heads: 2,
-        embed: 8,
-        architecture: Architecture::GPT2,
+        ..crate::model::tests::TINY
     };
 
     #[test]
@@ -259,5 +262,12 @@ mod tests {
     fn missing_tensor_is_reported_by_name() {
         let error = convert(&SafeTensors::default(), TINY).unwrap_err();
         assert!(error.contains("wte.weight"), "{error}");
+    }
+
+    #[test]
+    fn another_architecture_is_refused() {
+        let modern = TINY.with_architecture(Architecture::MODERN);
+        let error = convert(&SafeTensors::default(), modern).unwrap_err();
+        assert!(error.contains("GPT-2"), "{error}");
     }
 }

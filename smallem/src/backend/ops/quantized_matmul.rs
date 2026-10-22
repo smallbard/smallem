@@ -18,7 +18,10 @@ use crate::quantize::Format;
 /// par la mémoire. La forme déquantifiée sert les gros produits, où l'on
 /// calcule plus qu'on ne lit, et c'est la définition de référence.
 ///
-/// L'opération ne sert qu'à l'inférence : elle n'a pas de rétropropagation.
+/// Les poids quantifiés sont figés : ni les codes, ni les échelles, ni les
+/// poids déquantifiés ne reçoivent de gradient. L'entrée et le biais en
+/// reçoivent un, comme dans une couche affine : on peut ainsi entraîner un
+/// adaptateur au-dessus d'un modèle quantifié.
 pub struct QuantizedMatmul {
     pub format: Format,
 }
@@ -52,13 +55,38 @@ impl Reference for QuantizedMatmul {
         }
     }
 
+    /// `dx = g · Wᵀ` et `db = g` sommé sur toutes les lignes, où `W` est la
+    /// matrice déquantifiée.
     fn reference_backward<B: Primitives>(
         &self,
-        _: &B,
-        _: &[&B::Tensor],
-        _: &B::Tensor,
-        _: &B::Tensor,
+        backend: &B,
+        inputs: &[&B::Tensor],
+        output: &B::Tensor,
+        grad: &B::Tensor,
     ) -> Vec<Option<B::Tensor>> {
-        panic!("quantized_matmul ne sert qu'à l'inférence : elle n'a pas de gradient")
+        self.reference_backward_needed(backend, inputs, output, grad, &[true; 5])
+    }
+
+    fn reference_backward_needed<B: Primitives>(
+        &self,
+        backend: &B,
+        inputs: &[&B::Tensor],
+        _: &B::Tensor,
+        grad: &B::Tensor,
+        needed: &[bool],
+    ) -> Vec<Option<B::Tensor>> {
+        let (_, _, _, dequantized, bias) = Self::operands(inputs);
+        let grad_x = needed[0].then(|| backend.matmul(grad, &backend.transpose(dequantized, 0, 1)));
+        let mut grads = vec![grad_x, None, None, None];
+        if bias.is_some() {
+            grads.push(needed[4].then(|| {
+                let mut grad_bias = grad.clone();
+                while backend.shape(&grad_bias).len() > 1 {
+                    grad_bias = backend.sum(&grad_bias, 0, false);
+                }
+                grad_bias
+            }));
+        }
+        grads
     }
 }

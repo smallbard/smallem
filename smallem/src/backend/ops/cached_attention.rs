@@ -34,7 +34,8 @@ use crate::backend::{Float, Primitives};
 /// valeurs.
 ///
 /// L'opération ne sert qu'à la génération, qui ne calcule pas de gradient :
-/// elle n'a pas de rétropropagation.
+/// aucun gradient ne la traverse. La tape enregistre sa sortie comme une
+/// constante ([`Tape::cached_attention`](crate::autograd::Tape::cached_attention)).
 pub struct CachedAttention {
     pub scale: f64,
     pub value_dim: Option<usize>,
@@ -143,7 +144,7 @@ impl Reference for CachedAttention {
             backend.from_vec(kept, &[lines, dims.kv_heads, dims.value_dim])
         };
         let q = backend.reshape(q, &[dims.queries, dims.heads * dims.key_dim]);
-        let mut out: Option<B::Tensor> = None;
+        let mut out = Vec::with_capacity(dims.queries);
         for row in 0..dims.queries {
             let (sequence, count) = (rows[2 * row], rows[2 * row + 1]);
             assert!(
@@ -166,23 +167,38 @@ impl Reference for CachedAttention {
                 &scale,
             );
             let mixed = backend.matmul(&backend.softmax(&scores), &values);
-            let mixed = backend.reshape(&mixed, &[1, dims.heads * dims.value_dim]);
-            out = Some(match out {
-                Some(done) => backend.concat_rows(&done, &mixed),
-                None => mixed,
-            });
+            out.push(backend.reshape(&mixed, &[1, dims.heads * dims.value_dim]));
         }
-        let out = out.expect("cached_attention : aucune requête");
+        let out = concat_all(backend, out).expect("cached_attention : aucune requête");
         backend.reshape(&out, &[dims.queries, dims.heads, dims.value_dim])
     }
 
+    /// Aucun gradient : voir la documentation de l'opération.
     fn reference_backward<B: Primitives>(
         &self,
         _: &B,
-        _: &[&B::Tensor],
+        inputs: &[&B::Tensor],
         _: &B::Tensor,
         _: &B::Tensor,
     ) -> Vec<Option<B::Tensor>> {
-        panic!("cached_attention ne sert qu'à la génération : elle n'a pas de gradient")
+        inputs.iter().map(|_| None).collect()
     }
+}
+
+/// Met les tenseurs `parts` bout à bout le long de la première dimension,
+/// deux par deux : chaque élément est recopié une fois par niveau, soit
+/// `log₂ R` fois, au lieu de `R` fois en les ajoutant un à un.
+fn concat_all<B: Primitives>(backend: &B, mut parts: Vec<B::Tensor>) -> Option<B::Tensor> {
+    while parts.len() > 1 {
+        let mut pairs = Vec::with_capacity(parts.len().div_ceil(2));
+        let mut rest = parts.into_iter();
+        while let Some(first) = rest.next() {
+            pairs.push(match rest.next() {
+                Some(second) => backend.concat_rows(&first, &second),
+                None => first,
+            });
+        }
+        parts = pairs;
+    }
+    parts.pop()
 }

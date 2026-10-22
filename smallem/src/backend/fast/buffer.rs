@@ -34,9 +34,11 @@ static RESERVE: Mutex<Option<Reserve>> = Mutex::new(None);
 pub struct Buffer(Vec<f32>);
 
 impl Buffer {
-    /// Un tampon de `len` éléments, au contenu quelconque : à écrire en
-    /// entier avant de le lire.
-    pub fn uninit(len: usize) -> Self {
+    /// Un tampon de `len` éléments, au contenu quelconque : repris de la
+    /// réserve, il garde ce qu'il contenait ; neuf, il vaut zéro. Le
+    /// système donne déjà des pages à zéro (`calloc`), la mise à zéro ne
+    /// coûte donc rien de plus que la première écriture.
+    pub fn any(len: usize) -> Self {
         if len >= SMALLEST {
             let mut reserve = RESERVE.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(reserve) = reserve.as_mut()
@@ -46,14 +48,7 @@ impl Buffer {
                 return Self(buffer);
             }
         }
-        let mut data = Vec::with_capacity(len);
-        // SAFETY : `f32` n'a ni destructeur ni valeur invalide ; l'appelant
-        // écrit tout avant de lire.
-        #[allow(clippy::uninit_vec)]
-        unsafe {
-            data.set_len(len);
-        }
-        Self(data)
+        Self(vec![0.0; len])
     }
 
     pub fn into_vec(mut self) -> Vec<f32> {
@@ -78,7 +73,7 @@ impl From<Vec<f32>> for Buffer {
 
 impl Clone for Buffer {
     fn clone(&self) -> Self {
-        let mut copy = Self::uninit(self.0.len());
+        let mut copy = Self::any(self.0.len());
         copy.0.copy_from_slice(&self.0);
         copy
     }
@@ -128,10 +123,10 @@ mod tests {
     fn an_abandoned_buffer_is_taken_again() {
         // Une taille que les autres tests n'utilisent pas.
         let len = SMALLEST + 12_345;
-        let first = Buffer::uninit(len);
+        let first = Buffer::any(len);
         let address = first.as_ptr();
         drop(first);
-        let second = Buffer::uninit(len);
+        let second = Buffer::any(len);
         assert_eq!(second.as_ptr(), address);
         assert_eq!(second.len(), len);
     }

@@ -29,21 +29,35 @@ impl Reference for TransposedMatmul {
         backend.matmul(a, &backend.transpose(b, 0, 1))
     }
 
-    /// `da = g · b` et `db = gᵀ · a`, les lignes de `a` et de `g` mises
-    /// bout à bout.
     fn reference_backward<B: Primitives>(
+        &self,
+        backend: &B,
+        inputs: &[&B::Tensor],
+        output: &B::Tensor,
+        grad: &B::Tensor,
+    ) -> Vec<Option<B::Tensor>> {
+        self.reference_backward_needed(backend, inputs, output, grad, &[true; 2])
+    }
+
+    /// `da = g · b` et `db = gᵀ · a`, les lignes de `a` et de `g` mises
+    /// bout à bout ; seulement ceux qu'on attend.
+    fn reference_backward_needed<B: Primitives>(
         &self,
         backend: &B,
         inputs: &[&B::Tensor],
         _: &B::Tensor,
         grad: &B::Tensor,
+        needed: &[bool],
     ) -> Vec<Option<B::Tensor>> {
         let [a, b] = operands(Self::NAME, inputs);
-        let (width, outputs) = (backend.shape(a).len(), backend.shape(b)[0]);
-        let rows: usize = backend.shape(a)[..width - 1].iter().product();
-        let flat_a = backend.reshape(a, &[rows, backend.shape(b)[1]]);
-        let flat_grad = backend.reshape(grad, &[rows, outputs]);
-        let grad_b = backend.matmul(&backend.transpose(&flat_grad, 0, 1), &flat_a);
-        vec![Some(backend.matmul(grad, b)), Some(grad_b)]
+        let grad_a = needed[0].then(|| backend.matmul(grad, b));
+        let grad_b = needed[1].then(|| {
+            let (width, outputs) = (backend.shape(a).len(), backend.shape(b)[0]);
+            let rows: usize = backend.shape(a)[..width - 1].iter().product();
+            let flat_a = backend.reshape(a, &[rows, backend.shape(b)[1]]);
+            let flat_grad = backend.reshape(grad, &[rows, outputs]);
+            backend.matmul(&backend.transpose(&flat_grad, 0, 1), &flat_a)
+        });
+        vec![grad_a, grad_b]
     }
 }

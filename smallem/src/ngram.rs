@@ -172,19 +172,30 @@ pub fn trigram_key(recent_first: &[u32], vocab: usize) -> u64 {
 }
 
 /// Les trigrammes distincts de `tokens`, tels que les lit la mémoire (voir
-/// [`suffix`]), et leurs comptes, triés par [`trigram_key`]. Les clés sont
+/// [`suffix`]), et leurs comptes, triés par [`trigram_key`] : comme
+/// [`trigram_counts_of`] pour une seule séquence.
+pub fn trigram_counts(tokens: &[u32], vocab: usize) -> Vec<(u64, u32)> {
+    trigram_counts_of(&[tokens], vocab)
+}
+
+/// Les trigrammes distincts de plusieurs séquences, chacune lue à part : un
+/// trigramme ne va jamais d'une séquence à la suivante. Les clés sont
 /// d'abord réparties selon leur token le plus ancien, puis chaque part est
 /// triée sur son propre fil.
-pub fn trigram_counts(tokens: &[u32], vocab: usize) -> Vec<(u64, u32)> {
+pub fn trigram_counts_of(sequences: &[&[u32]], vocab: usize) -> Vec<(u64, u32)> {
     let v = vocab as u64;
-    let key = |t: usize| -> u64 {
+    fn keys_of(sequence: &[u32], vocab: usize) -> impl Iterator<Item = u64> + '_ {
         let mut gram = [0u32; 3];
-        suffix(tokens, t, &mut gram);
-        trigram_key(&gram, vocab)
-    };
+        (0..sequence.len()).map(move |t| {
+            suffix(sequence, t, &mut gram);
+            trigram_key(&gram, vocab)
+        })
+    }
     let mut sizes = vec![0usize; vocab];
-    for t in 0..tokens.len() {
-        sizes[(key(t) / (v * v)) as usize] += 1;
+    for sequence in sequences {
+        for k in keys_of(sequence, vocab) {
+            sizes[(k / (v * v)) as usize] += 1;
+        }
     }
     let mut next = Vec::with_capacity(vocab);
     let mut start = 0;
@@ -192,12 +203,13 @@ pub fn trigram_counts(tokens: &[u32], vocab: usize) -> Vec<(u64, u32)> {
         next.push(start);
         start += size;
     }
-    let mut keys = vec![0u64; tokens.len()];
-    for t in 0..tokens.len() {
-        let k = key(t);
-        let bucket = (k / (v * v)) as usize;
-        keys[next[bucket]] = k;
-        next[bucket] += 1;
+    let mut keys = vec![0u64; start];
+    for sequence in sequences {
+        for k in keys_of(sequence, vocab) {
+            let bucket = (k / (v * v)) as usize;
+            keys[next[bucket]] = k;
+            next[bucket] += 1;
+        }
     }
     let threads = std::thread::available_parallelism().map_or(8, |n| n.get());
     let mut parts: Vec<&mut [u64]> = Vec::with_capacity(vocab);
@@ -208,23 +220,15 @@ pub fn trigram_counts(tokens: &[u32], vocab: usize) -> Vec<(u64, u32)> {
         rest = tail;
     }
     let per_thread = parts.len().div_ceil(threads);
-    let counted: Vec<Vec<(u64, u32)>> = std::thread::scope(|scope| {
-        let handles: Vec<_> = parts
-            .chunks_mut(per_thread)
-            .map(|group| {
-                scope.spawn(move || {
-                    let mut out = Vec::new();
-                    for part in group.iter_mut() {
-                        part.sort_unstable();
-                        for run in part.chunk_by(|a, b| a == b) {
-                            out.push((run[0], run.len() as u32));
-                        }
-                    }
-                    out
-                })
-            })
-            .collect();
-        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    let counted = on_threads(parts.chunks_mut(per_thread), |group| {
+        let mut out = Vec::new();
+        for part in group.iter_mut() {
+            part.sort_unstable();
+            for run in part.chunk_by(|a, b| a == b) {
+                out.push((run[0], run.len() as u32));
+            }
+        }
+        out
     });
     counted.into_iter().flatten().collect()
 }
@@ -238,7 +242,7 @@ pub fn count_of(sorted: &[(u64, u32)], key: u64) -> u32 {
 }
 
 /// Le plus petit nombre premier supérieur ou égal à `n`.
-pub fn next_prime(n: usize) -> usize {
+fn next_prime(n: usize) -> usize {
     let mut candidate = n.max(2);
     while !is_prime(candidate) {
         candidate += 1;
@@ -271,6 +275,246 @@ fn splitmix64(state: &mut u64) -> u64 {
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
     z ^ (z >> 31)
+}
+
+/// Applique `work` à chaque élément de `items`, chacun sur son propre fil,
+/// et rend les résultats dans l'ordre. La panique d'un fil se propage.
+fn on_threads<T: Send, R: Send>(
+    items: impl IntoIterator<Item = T>,
+    work: impl Fn(T) -> R + Sync,
+) -> Vec<R> {
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = items
+            .into_iter()
+            .map(|item| {
+                let work = &work;
+                scope.spawn(move || work(item))
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| {
+                handle
+                    .join()
+                    .unwrap_or_else(|p| std::panic::resume_unwind(p))
+            })
+            .collect()
+    })
+}
+
+/// Les comptes d'unigrammes, de bigrammes et de trigrammes d'un corpus fait
+/// de plusieurs séquences, tels que les lit la mémoire (voir [`suffix`]) :
+/// de quoi faire les modèles par comptage qui disent ce qu'une table sait à
+/// elle seule.
+///
+/// Chaque probabilité conditionnelle divise un compte par celui de son
+/// contexte **compté de la même façon** : la somme, sur le token prédit, des
+/// n-grammes qui commencent par ce contexte. Les conditionnelles d'un
+/// contexte vu somment ainsi à 1, même quand le contexte contient des fins
+/// de document ajoutées par [`suffix`].
+pub struct NgramCounts {
+    vocab: usize,
+    tokens: u64,
+    unigrams: Vec<u64>,
+    /// `V × V`, rangé par contexte : `bigrams[b · V + c]`.
+    bigrams: Vec<u32>,
+    /// La somme de chaque ligne de `bigrams`.
+    bigram_contexts: Vec<u64>,
+    /// Triés par [`trigram_key`].
+    trigrams: Vec<(u64, u32)>,
+    /// Pour chaque contexte `a · V + b` vu, la somme de ses trigrammes ;
+    /// triés.
+    trigram_contexts: Vec<(u64, u64)>,
+}
+
+impl NgramCounts {
+    pub fn new(sequences: &[&[u32]], vocab: usize) -> Self {
+        let v = vocab as u64;
+        let mut unigrams = vec![0u64; vocab];
+        let mut bigrams = vec![0u32; vocab * vocab];
+        let mut gram = [0u32; 2];
+        let mut tokens = 0u64;
+        for sequence in sequences {
+            tokens += sequence.len() as u64;
+            for t in 0..sequence.len() {
+                unigrams[sequence[t] as usize] += 1;
+                suffix(sequence, t, &mut gram);
+                bigrams[gram[1] as usize * vocab + gram[0] as usize] += 1;
+            }
+        }
+        let bigram_contexts = bigrams
+            .chunks(vocab)
+            .map(|row| row.iter().map(|&c| u64::from(c)).sum())
+            .collect();
+        let trigrams = trigram_counts_of(sequences, vocab);
+        let mut trigram_contexts: Vec<(u64, u64)> = Vec::new();
+        for &(key, count) in &trigrams {
+            let context = key / v;
+            match trigram_contexts.last_mut() {
+                Some((last, total)) if *last == context => *total += u64::from(count),
+                _ => trigram_contexts.push((context, u64::from(count))),
+            }
+        }
+        Self {
+            vocab,
+            tokens,
+            unigrams,
+            bigrams,
+            bigram_contexts,
+            trigrams,
+            trigram_contexts,
+        }
+    }
+
+    pub fn vocab(&self) -> usize {
+        self.vocab
+    }
+
+    /// Les bigrammes vus et leurs comptes, triés par clé `b · V + c`.
+    pub fn bigrams(&self) -> Vec<(u64, u32)> {
+        self.bigrams
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| **c > 0)
+            .map(|(k, c)| (k as u64, *c))
+            .collect()
+    }
+
+    /// Les trigrammes vus et leurs comptes, triés par [`trigram_key`].
+    pub fn trigrams(&self) -> &[(u64, u32)] {
+        &self.trigrams
+    }
+
+    /// Les probabilités que donnent au token `x_t` de `sequence` les modèles
+    /// uniforme, unigramme, bigramme et trigramme. Un contexte jamais vu
+    /// donne une probabilité nulle : l'interpolation s'en remet alors aux
+    /// autres modèles.
+    pub fn components(&self, sequence: &[u32], t: usize) -> [f64; 4] {
+        let v = self.vocab as u64;
+        let mut gram = [0u32; 3];
+        suffix(sequence, t, &mut gram);
+        let (c, b, a) = (u64::from(gram[0]), u64::from(gram[1]), u64::from(gram[2]));
+        let ratio = |count: f64, context: u64| {
+            if context > 0 {
+                count / context as f64
+            } else {
+                0.0
+            }
+        };
+        let bigram = f64::from(self.bigrams[(b * v + c) as usize]);
+        let trigram = f64::from(count_of(&self.trigrams, (a * v + b) * v + c));
+        let pair = self
+            .trigram_contexts
+            .binary_search_by_key(&(a * v + b), |(k, _)| *k)
+            .map_or(0, |i| self.trigram_contexts[i].1);
+        [
+            1.0 / v as f64,
+            self.unigrams[c as usize] as f64 / self.tokens as f64,
+            ratio(bigram, self.bigram_contexts[b as usize]),
+            ratio(trigram, pair),
+        ]
+    }
+}
+
+/// La part des occurrences couverte par les `top` n-grammes les plus
+/// fréquents de `grams`.
+pub fn coverage(grams: &[(u64, u32)], top: usize) -> f64 {
+    let mut counts: Vec<u32> = grams.iter().map(|(_, c)| *c).collect();
+    counts.sort_unstable_by(|a, b| b.cmp(a));
+    let total: u64 = counts.iter().map(|&c| u64::from(c)).sum();
+    let kept: u64 = counts.iter().take(top).map(|&c| u64::from(c)).sum();
+    kept as f64 / total as f64
+}
+
+/// La part des occurrences dont le n-gramme est le plus fréquent de sa
+/// ligne : dans la première tête de son ordre, puis dans au moins une de
+/// ses têtes. Une ligne partagée sert surtout son n-gramme le plus
+/// fréquent. `grams` sont des n-grammes d'ordre `order` (2 ou 3), donnés
+/// par leur clé pour un vocabulaire de `vocab` tokens, comme
+/// [`trigram_key`] et [`NgramCounts::bigrams`]. Une tête par fil.
+pub fn collisions(
+    hash: &NgramHash,
+    grams: &[(u64, u32)],
+    order: usize,
+    vocab: usize,
+) -> (f64, f64) {
+    assert!(
+        (2..=hash.max_order()).contains(&order),
+        "ordre {order} hors du hachage (2 à {})",
+        hash.max_order()
+    );
+    let v = vocab as u64;
+    let heads = hash.heads();
+    // Le n-gramme d'une clé, du plus récent au plus ancien token.
+    let tokens = |mut key: u64| -> [u32; 3] {
+        let mut out = [0u32; 3];
+        for slot in out.iter_mut().take(order) {
+            *slot = (key % v) as u32;
+            key /= v;
+        }
+        out
+    };
+    let owned: Vec<Vec<bool>> = on_threads(0..heads, |head| {
+        let table = (order - 2) * heads + head;
+        let row = |k: u64| hash.hash(table, &tokens(k)) as usize;
+        let mut most = vec![0u32; hash.rows(table)];
+        for (k, count) in grams {
+            let slot = &mut most[row(*k)];
+            *slot = (*slot).max(*count);
+        }
+        grams
+            .iter()
+            .map(|(k, count)| most[row(*k)] == *count)
+            .collect()
+    });
+    let total: u64 = grams.iter().map(|(_, c)| u64::from(*c)).sum();
+    let (mut one, mut all) = (0u64, 0u64);
+    for (i, (_, count)) in grams.iter().enumerate() {
+        if owned[0][i] {
+            one += u64::from(*count);
+        }
+        if owned.iter().any(|head| head[i]) {
+            all += u64::from(*count);
+        }
+    }
+    (one as f64 / total as f64, all as f64 / total as f64)
+}
+
+/// Les poids d'interpolation des `used` premières composantes, ajustés par
+/// l'algorithme EM : chaque poids devient la part moyenne de la probabilité
+/// qu'apporte sa composante.
+pub fn interpolation(components: &[[f64; 4]], used: usize) -> Vec<f64> {
+    let mut weights = vec![1.0 / used as f64; used];
+    for _ in 0..50 {
+        let mut shares = vec![0.0; used];
+        for row in components {
+            let mixed: f64 = (0..used).map(|i| weights[i] * row[i]).sum();
+            for i in 0..used {
+                shares[i] += weights[i] * row[i] / mixed;
+            }
+        }
+        for (weight, share) in weights.iter_mut().zip(shares) {
+            *weight = share / components.len() as f64;
+        }
+    }
+    weights
+}
+
+/// La perte moyenne, en nats par token, du mélange des composantes par
+/// `weights` (les premières seulement si `weights` est plus court).
+pub fn cross_entropy(components: &[[f64; 4]], weights: &[f64]) -> f64 {
+    let total: f64 = components
+        .iter()
+        .map(|row| {
+            -weights
+                .iter()
+                .zip(row)
+                .map(|(w, p)| w * p)
+                .sum::<f64>()
+                .ln()
+        })
+        .sum();
+    total / components.len() as f64
 }
 
 #[cfg(test)]
@@ -364,5 +608,88 @@ mod tests {
         all.sort();
         all.dedup();
         assert_eq!(all.len(), grams.len());
+    }
+
+    /// Un petit corpus, coupé en deux séquences, avec des fins de document.
+    fn corpus() -> Vec<Vec<u32>> {
+        vec![
+            vec![3, 4, 5, 3, 4, 6, END, 3, 4, 5, END, END, 7],
+            vec![4, 5, 3, END, 6, 6, 6, 3],
+        ]
+    }
+
+    #[test]
+    fn conditionals_sum_to_one() {
+        let corpus = corpus();
+        let sequences: Vec<&[u32]> = corpus.iter().map(Vec::as_slice).collect();
+        let vocab = 300;
+        let counts = NgramCounts::new(&sequences, vocab);
+        // Pour chaque position, la somme sur le token prédit de chaque
+        // modèle vaut 1 : on remplace le dernier token par chacun des
+        // tokens du vocabulaire.
+        for sequence in &corpus {
+            for t in 0..sequence.len() {
+                let mut sums = [0.0; 4];
+                let mut changed = sequence.clone();
+                for c in 0..vocab as u32 {
+                    changed[t] = c;
+                    for (sum, p) in sums.iter_mut().zip(counts.components(&changed, t)) {
+                        *sum += p;
+                    }
+                }
+                for (model, sum) in sums.iter().enumerate() {
+                    assert!((sum - 1.0).abs() < 1e-12, "modèle {model}, t = {t} : {sum}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ngrams_do_not_cross_from_one_sequence_to_the_next() {
+        let joined: Vec<u32> = corpus().concat();
+        let corpus = corpus();
+        let apart: Vec<&[u32]> = corpus.iter().map(Vec::as_slice).collect();
+        let key = |a: u32, b: u32, c: u32| trigram_key(&[c, b, a], 300);
+        // `6, 7 | 4` n'existe que si l'on colle les deux séquences.
+        assert_eq!(count_of(&trigram_counts(&joined, 300), key(END, 7, 4)), 1);
+        let counts = trigram_counts_of(&apart, 300);
+        assert_eq!(count_of(&counts, key(END, 7, 4)), 0);
+        // Le début de la seconde séquence compte comme un début de document.
+        assert_eq!(count_of(&counts, key(END, END, 4)), 1);
+        let total: u32 = counts.iter().map(|(_, c)| c).sum();
+        assert_eq!(total as usize, joined.len());
+    }
+
+    #[test]
+    fn interpolation_prefers_the_component_that_explains_the_data() {
+        // La deuxième composante donne toujours plus de probabilité : son
+        // poids grandit, et la perte du mélange baisse.
+        let rows = vec![[0.1, 0.5, 0.0, 0.0]; 20];
+        let weights = interpolation(&rows, 2);
+        assert!(weights[1] > 0.99, "{weights:?}");
+        assert!((weights.iter().sum::<f64>() - 1.0).abs() < 1e-12);
+        assert!(cross_entropy(&rows, &weights) < cross_entropy(&rows, &[0.5, 0.5]));
+        assert!((cross_entropy(&rows, &[0.0, 1.0]) - 0.5f64.ln().abs()).abs() < 1e-12);
+    }
+
+    #[test]
+    fn coverage_counts_the_most_frequent_first() {
+        let grams = [(0, 1), (1, 6), (2, 3)];
+        assert_eq!(coverage(&grams, 1), 0.6);
+        assert_eq!(coverage(&grams, 3), 1.0);
+    }
+
+    #[test]
+    fn collisions_vanish_with_large_tables() {
+        let corpus = corpus();
+        let sequences: Vec<&[u32]> = corpus.iter().map(Vec::as_slice).collect();
+        let counts = NgramCounts::new(&sequences, 300);
+        let hash = NgramHash::new(3, 4, 1 << 16, 1);
+        assert_eq!(collisions(&hash, &counts.bigrams(), 2, 300), (1.0, 1.0));
+        assert_eq!(collisions(&hash, counts.trigrams(), 3, 300), (1.0, 1.0));
+        // Une table de deux lignes, elle, mélange tout.
+        let tiny = NgramHash::new(3, 1, 2, 1);
+        let (one, all) = collisions(&tiny, counts.trigrams(), 3, 300);
+        assert!(one < 1.0 && one == all);
     }
 }

@@ -11,7 +11,11 @@ use std::marker::PhantomData;
 
 use rand::Rng;
 
-use super::shape::{broadcast_shapes, broadcast_strides, source_index, strides};
+use super::shape::{
+    broadcast_shapes, broadcast_strides, check_expand, check_mask, check_row_index, check_step,
+    concat_rows_shape, cross_entropy_dims, gather_rows_dims, scatter_add_rows_dims, source_index,
+    strides, write_rows_dims,
+};
 use super::{AdamWStep, Float, Primitives, float, standard_normal};
 
 /// Tableau à N dimensions, stocké à plat ligne par ligne (row-major) : le
@@ -224,12 +228,7 @@ impl<F: Float> CpuTensor<F> {
 
     /// Étire le tenseur jusqu'à la forme `shape` en recopiant ses éléments.
     pub fn expand(&self, shape: &[usize]) -> Self {
-        assert_eq!(
-            broadcast_shapes(&self.shape, shape),
-            shape,
-            "la forme {:?} ne s'étire pas à {shape:?}",
-            self.shape,
-        );
+        check_expand(&self.shape, shape);
         let strides = broadcast_strides(&self.shape, shape);
         let len: usize = shape.iter().product();
         let data = (0..len)
@@ -343,10 +342,11 @@ impl<F: Float> CpuTensor<F> {
         })
     }
 
-    // --- Opérations fusionnées ---
+    // --- Opérations élément par élément sans définition par primitives ---
     //
-    // Ici elles sont écrites avec les primitives, de la façon la plus
-    // lisible : c'est la définition à laquelle les kernels sont comparés.
+    // GELU, SiLU et la rotation des paires s'écrivent directement, élément
+    // par élément, avec les formules scalaires de `float` que les kernels
+    // appliquent aussi : c'est la définition à laquelle ils sont comparés.
 
     pub fn gelu(&self) -> Self {
         self.map(float::gelu)
@@ -410,13 +410,7 @@ impl<F: Float> CpuTensor<F> {
     /// Remplace par `value` les éléments où `mask` est non nul. Le masque
     /// s'étire à la forme du tenseur, pas l'inverse.
     pub fn masked_fill(&self, mask: &Self, value: F) -> Self {
-        assert_eq!(
-            broadcast_shapes(&self.shape, &mask.shape),
-            self.shape,
-            "le masque {:?} ne s'étire pas à la forme {:?}",
-            mask.shape,
-            self.shape,
-        );
+        check_mask(&self.shape, &mask.shape);
         self.zip_with(mask, |x, m| if m != F::ZERO { value } else { x })
     }
 
@@ -424,19 +418,10 @@ impl<F: Float> CpuTensor<F> {
     /// `[V, …]` et `N` indices donnent `[N, …]`. C'est la recherche
     /// d'embedding : la ligne `i` de la table pour le token `i`.
     pub fn gather_rows(&self, indices: &[u32]) -> Self {
-        assert!(
-            !self.shape.is_empty(),
-            "gather_rows demande au moins une dimension",
-        );
-        let row_len: usize = self.shape[1..].iter().product();
+        let row_len = gather_rows_dims(&self.shape, indices);
         let mut data = Vec::with_capacity(indices.len() * row_len);
         for &index in indices {
             let index = index as usize;
-            assert!(
-                index < self.shape[0],
-                "indice {index} hors de la première dimension ({})",
-                self.shape[0],
-            );
             data.extend_from_slice(&self.data[index * row_len..(index + 1) * row_len]);
         }
         let mut shape = self.shape.clone();
@@ -448,36 +433,19 @@ impl<F: Float> CpuTensor<F> {
     /// Comme le rangement est ligne par ligne, c'est mettre les données de
     /// l'un à la suite de celles de l'autre.
     pub fn concat_rows(&self, other: &Self) -> Self {
-        assert!(
-            !self.shape.is_empty() && self.shape[1..] == other.shape[1..],
-            "concat_rows : formes incompatibles {:?} et {:?}",
-            self.shape,
-            other.shape,
-        );
+        let shape = concat_rows_shape(&self.shape, &other.shape);
         let mut data = self.data.clone();
         data.extend_from_slice(&other.data);
-        let mut shape = self.shape.clone();
-        shape[0] += other.shape[0];
         Self { data, shape }
     }
 
     /// Inverse de `gather_rows` : la ligne `r` est ajoutée à la ligne
     /// `indices[r]` d'un tenseur nul de `num_rows` lignes.
     pub fn scatter_add_rows(&self, indices: &[u32], num_rows: usize) -> Self {
-        assert!(
-            !self.shape.is_empty() && self.shape[0] == indices.len(),
-            "scatter_add_rows : {} indices pour la forme {:?}",
-            indices.len(),
-            self.shape,
-        );
-        let row_len: usize = self.shape[1..].iter().product();
+        let row_len = scatter_add_rows_dims(&self.shape, indices, num_rows);
         let mut data = vec![F::ZERO; num_rows * row_len];
         for (row, &index) in indices.iter().enumerate() {
             let index = index as usize;
-            assert!(
-                index < num_rows,
-                "indice {index} hors de la première dimension ({num_rows})",
-            );
             for i in 0..row_len {
                 data[index * row_len + i] += self.data[row * row_len + i];
             }
@@ -489,27 +457,9 @@ impl<F: Float> CpuTensor<F> {
 
     // --- Perte ---
 
-    /// Vérifie les formes de l'entropie croisée et renvoie `(N, V)`.
-    fn cross_entropy_dims(&self, targets: &[u32]) -> (usize, usize) {
-        assert!(
-            self.shape.len() == 2 && self.shape[0] == targets.len(),
-            "cross_entropy : logits {:?} pour {} cibles, [N, V] attendu",
-            self.shape,
-            targets.len(),
-        );
-        let vocab = self.shape[1];
-        for &target in targets {
-            assert!(
-                (target as usize) < vocab,
-                "cible {target} hors du vocabulaire ({vocab})",
-            );
-        }
-        (self.shape[0], vocab)
-    }
-
     /// Moyenne de `-ln softmax(logits)[n, targets[n]]`, de forme `[]`.
     pub fn cross_entropy(&self, targets: &[u32]) -> Self {
-        let (n, vocab) = self.cross_entropy_dims(targets);
+        let (n, vocab) = cross_entropy_dims(&self.shape, targets);
         let log_probabilities = self.log_softmax();
         let mut total = F::ZERO;
         for (row, &target) in targets.iter().enumerate() {
@@ -520,7 +470,7 @@ impl<F: Float> CpuTensor<F> {
 
     /// `(softmax(logits) - onehot(targets)) / N`.
     pub fn cross_entropy_grad(&self, targets: &[u32]) -> Self {
-        let (n, vocab) = self.cross_entropy_dims(targets);
+        let (n, vocab) = cross_entropy_dims(&self.shape, targets);
         let mut grad = self.softmax();
         let scale = F::ONE / F::from_f64(n as f64);
         for (row, &target) in targets.iter().enumerate() {
@@ -533,45 +483,23 @@ impl<F: Float> CpuTensor<F> {
         grad
     }
 
-    // --- Mises à jour des paramètres ---
+    // --- Mises à jour sur place ---
 
-    /// `self -= learning_rate × grad`
     /// Écrit la ligne `r` de `rows` à la ligne `indices[r]` de ce tenseur.
     /// Les indices sont des entiers rangés dans un tenseur `[N]`.
     pub fn write_rows(&mut self, indices: &Self, rows: &Self) {
-        assert!(
-            !self.shape.is_empty() && !rows.shape.is_empty(),
-            "write_rows demande au moins une dimension",
-        );
-        assert_eq!(
-            self.shape[1..],
-            rows.shape[1..],
-            "write_rows : lignes {:?} pour une table {:?}",
-            rows.shape,
-            self.shape,
-        );
-        assert_eq!(
-            indices.data.len(),
-            rows.shape[0],
-            "write_rows : {} indices pour {} lignes",
-            indices.data.len(),
-            rows.shape[0],
-        );
-        let row_len: usize = self.shape[1..].iter().product();
+        let row_len = write_rows_dims(&self.shape, indices.data.len(), &rows.shape);
         for (row, &index) in indices.data.iter().enumerate() {
             let index = index.to_f64() as usize;
-            assert!(
-                index < self.shape[0],
-                "indice {index} hors de la première dimension ({})",
-                self.shape[0],
-            );
+            check_row_index(index, self.shape[0]);
             self.data[index * row_len..(index + 1) * row_len]
                 .copy_from_slice(&rows.data[row * row_len..(row + 1) * row_len]);
         }
     }
 
+    /// `self -= learning_rate × grad`
     pub fn sgd_step(&mut self, grad: &Self, learning_rate: f64) {
-        assert_eq!(self.shape, grad.shape, "gradient de forme inattendue");
+        check_step(&self.shape, &grad.shape, &[]);
         let learning_rate = F::from_f64(learning_rate);
         for (p, &g) in self.data.iter_mut().zip(&grad.data) {
             *p = *p - learning_rate * g;
@@ -586,33 +514,33 @@ impl<F: Float> CpuTensor<F> {
         second_moment: &mut Self,
         step: &AdamWStep,
     ) {
-        assert_eq!(self.shape, grad.shape, "gradient de forme inattendue");
-        assert_eq!(self.shape, first_moment.shape, "moment de forme inattendue");
-        assert_eq!(
-            self.shape, second_moment.shape,
-            "moment de forme inattendue"
+        check_step(
+            &self.shape,
+            &grad.shape,
+            &[&first_moment.shape, &second_moment.shape],
         );
-        let learning_rate = F::from_f64(step.learning_rate);
-        let beta1 = F::from_f64(step.beta1);
-        let beta2 = F::from_f64(step.beta2);
-        let epsilon = F::from_f64(step.epsilon);
-        let weight_decay = F::from_f64(step.weight_decay);
-        let correction1 = F::from_f64(step.bias_correction1);
-        let correction2 = F::from_f64(step.bias_correction2);
-        let grad_scale = F::from_f64(step.grad_scale);
-
-        for i in 0..self.data.len() {
-            let g = grad.data[i] * grad_scale;
-            let m = beta1 * first_moment.data[i] + (F::ONE - beta1) * g;
-            let v = beta2 * second_moment.data[i] + (F::ONE - beta2) * g * g;
-            first_moment.data[i] = m;
-            second_moment.data[i] = v;
-
-            let update = (m / correction1) / ((v / correction2).sqrt() + epsilon);
-            let p = self.data[i];
-            self.data[i] = p - learning_rate * (update + weight_decay * p);
+        let step = step.scalars::<F>();
+        for (i, (m, v)) in first_moment
+            .data
+            .iter_mut()
+            .zip(&mut second_moment.data)
+            .enumerate()
+        {
+            (self.data[i], *m, *v) = float::adamw_update(self.data[i], grad.data[i], *m, *v, &step);
         }
     }
+}
+
+/// Écrit des méthodes de [`Primitives`] qui appellent la méthode de même nom
+/// de leur premier tenseur.
+macro_rules! delegate {
+    ($(fn $name:ident(&self, $first:ident: $first_type:ty $(, $argument:ident: $type:ty)* $(,)?) $(-> $output:ty)?;)*) => {
+        $(
+            fn $name(&self, $first: $first_type $(, $argument: $type)*) $(-> $output)? {
+                $first.$name($($argument),*)
+            }
+        )*
+    };
 }
 
 /// Backend CPU : il ne porte aucun état, toutes les opérations sont des
@@ -642,107 +570,42 @@ impl<F: Float> Primitives for Cpu<F> {
         &tensor.shape
     }
 
-    fn add(&self, a: &CpuTensor<F>, b: &CpuTensor<F>) -> CpuTensor<F> {
-        a.add(b)
-    }
+    delegate! {
+        fn add(&self, a: &CpuTensor<F>, b: &CpuTensor<F>) -> CpuTensor<F>;
+        fn sub(&self, a: &CpuTensor<F>, b: &CpuTensor<F>) -> CpuTensor<F>;
+        fn mul(&self, a: &CpuTensor<F>, b: &CpuTensor<F>) -> CpuTensor<F>;
+        fn div(&self, a: &CpuTensor<F>, b: &CpuTensor<F>) -> CpuTensor<F>;
+        fn neg(&self, a: &CpuTensor<F>) -> CpuTensor<F>;
+        fn exp(&self, a: &CpuTensor<F>) -> CpuTensor<F>;
+        fn ln(&self, a: &CpuTensor<F>) -> CpuTensor<F>;
+        fn sqrt(&self, a: &CpuTensor<F>) -> CpuTensor<F>;
+        fn tanh(&self, a: &CpuTensor<F>) -> CpuTensor<F>;
 
-    fn sub(&self, a: &CpuTensor<F>, b: &CpuTensor<F>) -> CpuTensor<F> {
-        a.sub(b)
-    }
+        fn sum(&self, a: &CpuTensor<F>, axis: usize, keepdim: bool) -> CpuTensor<F>;
+        fn sum_all(&self, a: &CpuTensor<F>) -> CpuTensor<F>;
+        fn reshape(&self, a: &CpuTensor<F>, shape: &[usize]) -> CpuTensor<F>;
+        fn transpose(&self, a: &CpuTensor<F>, axis_a: usize, axis_b: usize) -> CpuTensor<F>;
+        fn expand(&self, a: &CpuTensor<F>, shape: &[usize]) -> CpuTensor<F>;
+        fn matmul(&self, a: &CpuTensor<F>, b: &CpuTensor<F>) -> CpuTensor<F>;
 
-    fn mul(&self, a: &CpuTensor<F>, b: &CpuTensor<F>) -> CpuTensor<F> {
-        a.mul(b)
-    }
+        fn softmax(&self, a: &CpuTensor<F>) -> CpuTensor<F>;
+        fn log_softmax(&self, a: &CpuTensor<F>) -> CpuTensor<F>;
 
-    fn div(&self, a: &CpuTensor<F>, b: &CpuTensor<F>) -> CpuTensor<F> {
-        a.div(b)
-    }
+        fn masked_fill(&self, a: &CpuTensor<F>, mask: &CpuTensor<F>, value: F) -> CpuTensor<F>;
+        fn gather_rows(&self, a: &CpuTensor<F>, indices: &[u32]) -> CpuTensor<F>;
+        fn scatter_add_rows(&self, a: &CpuTensor<F>, indices: &[u32], num_rows: usize) -> CpuTensor<F>;
+        fn concat_rows(&self, a: &CpuTensor<F>, b: &CpuTensor<F>) -> CpuTensor<F>;
 
-    fn neg(&self, a: &CpuTensor<F>) -> CpuTensor<F> {
-        a.neg()
-    }
-
-    fn exp(&self, a: &CpuTensor<F>) -> CpuTensor<F> {
-        a.exp()
-    }
-
-    fn ln(&self, a: &CpuTensor<F>) -> CpuTensor<F> {
-        a.ln()
-    }
-
-    fn sqrt(&self, a: &CpuTensor<F>) -> CpuTensor<F> {
-        a.sqrt()
-    }
-
-    fn tanh(&self, a: &CpuTensor<F>) -> CpuTensor<F> {
-        a.tanh()
-    }
-
-    fn sum(&self, a: &CpuTensor<F>, axis: usize, keepdim: bool) -> CpuTensor<F> {
-        a.sum(axis, keepdim)
-    }
-
-    fn sum_all(&self, a: &CpuTensor<F>) -> CpuTensor<F> {
-        a.sum_all()
-    }
-
-    fn reshape(&self, a: &CpuTensor<F>, shape: &[usize]) -> CpuTensor<F> {
-        a.reshape(shape)
-    }
-
-    fn transpose(&self, a: &CpuTensor<F>, axis_a: usize, axis_b: usize) -> CpuTensor<F> {
-        a.transpose(axis_a, axis_b)
-    }
-
-    fn expand(&self, a: &CpuTensor<F>, shape: &[usize]) -> CpuTensor<F> {
-        a.expand(shape)
-    }
-
-    fn matmul(&self, a: &CpuTensor<F>, b: &CpuTensor<F>) -> CpuTensor<F> {
-        a.matmul(b)
-    }
-
-    fn softmax(&self, a: &CpuTensor<F>) -> CpuTensor<F> {
-        a.softmax()
-    }
-
-    fn log_softmax(&self, a: &CpuTensor<F>) -> CpuTensor<F> {
-        a.log_softmax()
-    }
-
-    fn masked_fill(&self, a: &CpuTensor<F>, mask: &CpuTensor<F>, value: F) -> CpuTensor<F> {
-        a.masked_fill(mask, value)
-    }
-
-    fn gather_rows(&self, a: &CpuTensor<F>, indices: &[u32]) -> CpuTensor<F> {
-        a.gather_rows(indices)
-    }
-
-    fn scatter_add_rows(&self, a: &CpuTensor<F>, indices: &[u32], num_rows: usize) -> CpuTensor<F> {
-        a.scatter_add_rows(indices, num_rows)
-    }
-
-    fn concat_rows(&self, a: &CpuTensor<F>, b: &CpuTensor<F>) -> CpuTensor<F> {
-        a.concat_rows(b)
-    }
-
-    fn write_rows(&self, table: &mut CpuTensor<F>, indices: &CpuTensor<F>, rows: &CpuTensor<F>) {
-        table.write_rows(indices, rows);
-    }
-
-    fn sgd_step(&self, param: &mut CpuTensor<F>, grad: &CpuTensor<F>, learning_rate: f64) {
-        param.sgd_step(grad, learning_rate);
-    }
-
-    fn adamw_step(
-        &self,
-        param: &mut CpuTensor<F>,
-        grad: &CpuTensor<F>,
-        first_moment: &mut CpuTensor<F>,
-        second_moment: &mut CpuTensor<F>,
-        step: &AdamWStep,
-    ) {
-        param.adamw_step(grad, first_moment, second_moment, step);
+        fn write_rows(&self, table: &mut CpuTensor<F>, indices: &CpuTensor<F>, rows: &CpuTensor<F>);
+        fn sgd_step(&self, param: &mut CpuTensor<F>, grad: &CpuTensor<F>, learning_rate: f64);
+        fn adamw_step(
+            &self,
+            param: &mut CpuTensor<F>,
+            grad: &CpuTensor<F>,
+            first_moment: &mut CpuTensor<F>,
+            second_moment: &mut CpuTensor<F>,
+            step: &AdamWStep,
+        );
     }
 }
 

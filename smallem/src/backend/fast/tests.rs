@@ -425,6 +425,58 @@ fn products() {
 }
 
 #[test]
+fn backward_skips_the_gradients_nobody_needs() {
+    // `Fast` et la référence : les gradients demandés sont ceux de la
+    // rétropropagation complète, au bit près ; les autres ne sont pas
+    // calculés.
+    fn check<B: Backend + Run<O>, O: crate::backend::ops::Operation>(
+        backend: &B,
+        op: &O,
+        inputs: &[Input],
+        grad: &Input,
+    ) {
+        let tensor = |(data, shape): &Input| {
+            let data = data
+                .iter()
+                .map(|&x| B::Scalar::from_f64(x as f64))
+                .collect();
+            backend.from_vec(data, shape)
+        };
+        let tensors: Vec<B::Tensor> = inputs.iter().map(tensor).collect();
+        let refs: Vec<&B::Tensor> = tensors.iter().collect();
+        let grad = tensor(grad);
+        let output = backend.run(op, &refs);
+        let full = backend.run_backward(op, &refs, &output, &grad);
+        for skipped in 0..inputs.len() {
+            let needed: Vec<bool> = (0..inputs.len()).map(|i| i != skipped).collect();
+            let some = backend.run_backward_needed(op, &refs, &output, None, &grad, &needed);
+            for (index, (all, partial)) in full.iter().zip(&some).enumerate() {
+                if index == skipped {
+                    assert!(partial.is_none(), "gradient {index} calculé pour rien");
+                } else {
+                    let (all, partial) = (all.as_ref().unwrap(), partial.as_ref().unwrap());
+                    assert_eq!(backend.to_vec(all), backend.to_vec(partial));
+                }
+            }
+        }
+    }
+    let affine = random_inputs(&[&[4, 9, 33], &[33, 21], &[21], &[4, 9, 21]], 2);
+    let transposed = random_inputs(&[&[9, 300], &[100, 300], &[9, 100]], 3);
+    for fast in fast_backends() {
+        check(&fast, &Affine, &affine[..3], &affine[3]);
+        check(&fast, &TransposedMatmul, &transposed[..2], &transposed[2]);
+    }
+    let reference = Cpu::<f64>::new();
+    check(&reference, &Affine, &affine[..3], &affine[3]);
+    check(
+        &reference,
+        &TransposedMatmul,
+        &transposed[..2],
+        &transposed[2],
+    );
+}
+
+#[test]
 fn concat() {
     check_op!(
         Concat,
@@ -548,5 +600,15 @@ fn quantized_matmul() {
             .run(&op, &[&t[0], &t[1], &t[2], &t[3]]));
         check_with!(all.clone(), true, |b, t| b
             .run(&op, &[&t[0], &t[1], &t[2], &t[3], &t[4]]));
+        // Le gradient de l'entrée, celui d'un produit par `Wᵀ`.
+        let grad = random_inputs(&[&[rows, n]], 2).remove(0);
+        let with_grad = [all, vec![grad]].concat();
+        check_with!(with_grad.clone(), true, |b, t| {
+            let inputs = [&t[0], &t[1], &t[2], &t[3], &t[4]];
+            let output = b.run(&op, &inputs);
+            b.run_backward(&op, &inputs, &output, &t[5])[0]
+                .clone()
+                .unwrap()
+        });
     }
 }

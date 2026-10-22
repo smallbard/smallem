@@ -89,7 +89,7 @@ pub fn encode(tokenizer: &Bpe, roles: Roles, turn: &Turn) -> Encoded {
 
 /// Le texte d'une réponse : ses tokens jusqu'au premier `<|fin|>`, les
 /// autres tokens de rôle laissés de côté.
-pub fn answer_text(tokenizer: &Bpe, roles: Roles, tokens: &[u32]) -> String {
+pub(crate) fn answer_text(tokenizer: &Bpe, roles: Roles, tokens: &[u32]) -> String {
     let text: Vec<u16> = tokens
         .iter()
         .take_while(|&&t| t != roles.end)

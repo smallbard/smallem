@@ -12,6 +12,7 @@
 //! est le même au bit près.
 
 use std::cell::Cell;
+use std::marker::PhantomData;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -204,36 +205,80 @@ impl Drop for Pool {
     }
 }
 
-/// Un pointeur qu'on peut partager entre fils, pour que chaque tâche écrive
-/// sa propre partie d'un même tampon.
-#[derive(Clone, Copy)]
-pub struct SharedMut<T>(*mut T);
+/// Un tampon qu'on peut partager entre fils, pour que chaque tâche écrive
+/// sa propre partie : un pointeur, la longueur du tampon, et l'emprunt dont
+/// il vient, qui l'empêche de survivre au tampon.
+///
+/// Les bornes sont vérifiées ; seul le partage reste à la charge de
+/// l'appelant : deux tâches ne doivent jamais écrire au même endroit.
+pub struct SharedMut<'a, T> {
+    ptr: *mut T,
+    len: usize,
+    _borrow: PhantomData<&'a mut [T]>,
+}
 
-unsafe impl<T> Send for SharedMut<T> {}
-unsafe impl<T> Sync for SharedMut<T> {}
+impl<T> Clone for SharedMut<'_, T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
 
-impl<T> SharedMut<T> {
-    pub fn new(slice: &mut [T]) -> Self {
-        Self(slice.as_mut_ptr())
+impl<T> Copy for SharedMut<'_, T> {}
+
+// SAFETY : chaque tâche reçoit une partie distincte du tampon (contrat de
+// `slice` et de `ptr`) : partager le pointeur revient à envoyer à chaque
+// fil un `&mut` sur sa partie, ce que permet `T: Send`.
+unsafe impl<T: Send> Send for SharedMut<'_, T> {}
+unsafe impl<T: Send> Sync for SharedMut<'_, T> {}
+
+impl<'a, T> SharedMut<'a, T> {
+    pub fn new(slice: &'a mut [T]) -> Self {
+        Self {
+            ptr: slice.as_mut_ptr(),
+            len: slice.len(),
+            _borrow: PhantomData,
+        }
     }
 
-    /// À partir d'un pointeur déjà partagé.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// La partie `[start, start + len)` du tampon, à partager à son tour.
+    pub fn view(self, start: usize, len: usize) -> Self {
+        assert!(
+            start <= self.len && len <= self.len - start,
+            "partie [{start}, {start} + {len}) hors d'un tampon de {}",
+            self.len
+        );
+        Self {
+            // SAFETY : `start <= len`, le pointeur reste dans le tampon ou
+            // juste après.
+            ptr: unsafe { self.ptr.add(start) },
+            len,
+            _borrow: PhantomData,
+        }
+    }
+
+    /// Un pointeur sur l'élément `offset`, pour un kernel qui écrit un bloc
+    /// à partir de là.
     ///
     /// # Safety
     ///
-    /// Les mêmes règles que pour [`SharedMut::slice`].
-    pub unsafe fn from_ptr(ptr: *mut T) -> Self {
-        Self(ptr)
-    }
-
-    /// Un pointeur sur l'élément `offset` du tampon.
-    ///
-    /// # Safety
-    ///
-    /// Les mêmes règles que pour [`SharedMut::slice`], pour tout ce qu'on
-    /// écrit à travers lui.
+    /// Tout ce qu'on écrit à travers lui doit rester dans le tampon, et
+    /// n'appartenir qu'à la tâche qui écrit.
     pub unsafe fn ptr(&self, offset: usize) -> *mut T {
-        unsafe { self.0.add(offset) }
+        assert!(
+            offset < self.len,
+            "élément {offset} hors d'un tampon de {}",
+            self.len
+        );
+        // SAFETY : `offset < len`.
+        unsafe { self.ptr.add(offset) }
     }
 
     /// La tranche `[start, start + len)` du tampon.
@@ -241,10 +286,17 @@ impl<T> SharedMut<T> {
     /// # Safety
     ///
     /// Deux tâches ne doivent jamais recevoir de tranches qui se recouvrent,
-    /// et le tampon doit vivre plus longtemps que l'appel.
+    /// ni lire une tranche qu'une autre écrit.
     #[allow(clippy::mut_from_ref)]
-    pub unsafe fn slice(&self, start: usize, len: usize) -> &mut [T] {
-        unsafe { std::slice::from_raw_parts_mut(self.0.add(start), len) }
+    pub unsafe fn slice(&self, start: usize, len: usize) -> &'a mut [T] {
+        assert!(
+            start <= self.len && len <= self.len - start,
+            "tranche [{start}, {start} + {len}) hors d'un tampon de {}",
+            self.len
+        );
+        // SAFETY : la tranche est dans le tampon, qui vit `'a` ; le partage
+        // est le contrat de l'appelant.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.add(start), len) }
     }
 }
 
@@ -304,11 +356,40 @@ mod tests {
         let mut data = vec![0usize; 1000];
         let out = SharedMut::new(&mut data);
         pool.run(10, |task| {
+            // SAFETY : chaque tâche prend ses 100 éléments.
             let part = unsafe { out.slice(task * 100, 100) };
             for (i, x) in part.iter_mut().enumerate() {
                 *x = task * 100 + i;
             }
         });
         assert!(data.iter().enumerate().all(|(i, &x)| i == x));
+    }
+
+    #[test]
+    #[should_panic(expected = "hors d'un tampon de 10")]
+    fn a_slice_beyond_the_buffer_is_refused() {
+        let mut data = vec![0u8; 10];
+        let out = SharedMut::new(&mut data);
+        // SAFETY : une seule tranche ; elle est refusée avant d'exister.
+        let _ = unsafe { out.slice(8, 3) };
+    }
+
+    #[test]
+    fn a_view_is_a_part_of_the_buffer() {
+        let mut data = vec![0u8; 10];
+        let part = SharedMut::new(&mut data).view(4, 3);
+        assert_eq!(part.len(), 3);
+        // SAFETY : une seule tranche.
+        unsafe { part.slice(0, 3) }.fill(1);
+        assert_eq!(data, [0, 0, 0, 0, 1, 1, 1, 0, 0, 0]);
+    }
+
+    #[test]
+    #[should_panic(expected = "hors d'un tampon de 3")]
+    fn a_view_keeps_its_bounds() {
+        let mut data = vec![0u8; 10];
+        let part = SharedMut::new(&mut data).view(4, 3);
+        // SAFETY : une seule tranche ; elle est refusée avant d'exister.
+        let _ = unsafe { part.slice(2, 2) };
     }
 }

@@ -1,13 +1,14 @@
 //! Modèle bigramme par comptage : la probabilité d'un token ne dépend que du
 //! token précédent. Aucun apprentissage, seulement des fréquences.
 //!
-//! Usage : `bigram [dossier_des_données]`
+//! Usage : `bigram [dossier_des_données]` (défaut : `../data`)
 
 use std::error::Error;
 use std::path::PathBuf;
 
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
+use smallem::cli::{self, Args};
 use smallem::data::Dataset;
 use smallem::sampling::sample;
 use smallem::tokenizer::{self, END_OF_DOCUMENT, VOCAB_SIZE};
@@ -68,7 +69,10 @@ impl Bigram {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let data_dir = PathBuf::from(std::env::args().nth(1).unwrap_or_else(|| "../data".into()));
+    let mut data_dir = PathBuf::from("../data");
+    for arg in Args::from_env() {
+        data_dir = cli::positional(&arg)?.into();
+    }
     let train = Dataset::load(data_dir.join("train.bin"))?;
     let val = Dataset::load(data_dir.join("val.bin"))?;
 

@@ -12,6 +12,7 @@ use crate::backend::ops::{
     Operation, QuantizedMatmul, Reference, RmsNormalize, RotatePairs, Run, Silu, TransposedMatmul,
     concat_widths, operands,
 };
+use crate::backend::shape::cross_entropy_dims;
 
 use super::attention;
 use super::gemm::Matrix;
@@ -222,7 +223,7 @@ impl Run<Concat> for Fast {
 impl Fast {
     /// `A · B` dans un nouveau tampon.
     pub(crate) fn gemm(&self, a: Matrix, b: Matrix) -> Buffer {
-        let mut out = Buffer::uninit(a.rows * b.cols);
+        let mut out = Buffer::any(a.rows * b.cols);
         self.gemm_into(a, b, &mut out, false);
         out
     }
@@ -280,18 +281,30 @@ impl Run<Affine> for Fast {
         FastTensor::new(out, &shape)
     }
 
-    fn run_backward(&self, _: &Affine, inputs: &[&T], _: &T, grad: &T) -> Vec<Option<T>> {
+    fn run_backward(&self, op: &Affine, inputs: &[&T], output: &T, grad: &T) -> Vec<Option<T>> {
+        self.run_backward_needed(op, inputs, output, None, grad, &[true; 3])
+    }
+
+    /// Les poids figés d'un adaptateur ne demandent pas `dW`, le plus gros
+    /// des trois produits.
+    fn run_backward_needed(
+        &self,
+        _: &Affine,
+        inputs: &[&T],
+        _: &T,
+        _: Option<&T>,
+        grad: &T,
+        needed: &[bool],
+    ) -> Vec<Option<T>> {
         let [x, weight, _] = operands(Affine::NAME, inputs);
         let (inner, outputs) = (weight.shape[0], weight.shape[1]);
         let rows = Self::rows_of(grad);
         let w = Matrix::new(weight.data(), inner, outputs);
-        let grad_x = self.gemm(rows, w.t());
-        let grad_weight = self.gemm(Self::rows_of(x).t(), rows);
-        let grad_bias = self.sum(&self.reshape(grad, &[rows.rows, outputs]), 0, false);
         vec![
-            Some(FastTensor::new(grad_x, &x.shape)),
-            Some(FastTensor::new(grad_weight, &weight.shape)),
-            Some(grad_bias),
+            needed[0].then(|| FastTensor::new(self.gemm(rows, w.t()), &x.shape)),
+            needed[1]
+                .then(|| FastTensor::new(self.gemm(Self::rows_of(x).t(), rows), &weight.shape)),
+            needed[2].then(|| self.sum(&self.reshape(grad, &[rows.rows, outputs]), 0, false)),
         ]
     }
 }
@@ -320,16 +333,36 @@ impl Run<TransposedMatmul> for Fast {
         FastTensor::new(out, &shape)
     }
 
-    /// `da = g · b` et `db = gᵀ · a`, les lignes du lot réunies.
-    fn run_backward(&self, _: &TransposedMatmul, inputs: &[&T], _: &T, grad: &T) -> Vec<Option<T>> {
+    fn run_backward(
+        &self,
+        op: &TransposedMatmul,
+        inputs: &[&T],
+        output: &T,
+        grad: &T,
+    ) -> Vec<Option<T>> {
+        self.run_backward_needed(op, inputs, output, None, grad, &[true; 2])
+    }
+
+    /// `da = g · b` et `db = gᵀ · a`, les lignes du lot réunies ; seulement
+    /// ceux qu'on attend.
+    fn run_backward_needed(
+        &self,
+        _: &TransposedMatmul,
+        inputs: &[&T],
+        _: &T,
+        _: Option<&T>,
+        grad: &T,
+        needed: &[bool],
+    ) -> Vec<Option<T>> {
         let [a, b] = operands(TransposedMatmul::NAME, inputs);
         let (outputs, inner) = (b.shape[0], b.shape[1]);
         let rows = Self::rows_of(grad);
-        let grad_a = self.gemm(rows, Matrix::new(b.data(), outputs, inner));
-        let grad_b = self.gemm(rows.t(), Self::rows_of(a));
         vec![
-            Some(FastTensor::new(grad_a, &a.shape)),
-            Some(FastTensor::new(grad_b, &b.shape)),
+            needed[0].then(|| {
+                let grad_a = self.gemm(rows, Matrix::new(b.data(), outputs, inner));
+                FastTensor::new(grad_a, &a.shape)
+            }),
+            needed[1].then(|| FastTensor::new(self.gemm(rows.t(), Self::rows_of(a)), &b.shape)),
         ]
     }
 }
@@ -442,40 +475,25 @@ impl Run<RotatePairs> for Fast {
     }
 }
 
-impl Fast {
-    /// Vérifie les formes de l'entropie croisée et renvoie `(N, V)`.
-    fn cross_entropy_dims(logits: &T, targets: &[u32]) -> (usize, usize) {
-        assert!(
-            logits.shape.len() == 2 && logits.shape[0] == targets.len(),
-            "cross_entropy : logits {:?} pour {} cibles, [N, V] attendu",
-            logits.shape,
-            targets.len(),
-        );
-        let vocab = logits.shape[1];
-        for &target in targets {
-            assert!(
-                (target as usize) < vocab,
-                "cible {target} hors du vocabulaire ({vocab})"
-            );
-        }
-        (logits.shape[0], vocab)
-    }
-}
-
 impl Run<CrossEntropy> for Fast {
-    /// `-ln softmax(logits)[cible]`, ligne par ligne, puis la moyenne.
+    /// `-ln softmax(logits)[cible] = ln Σ exp(logits) - logits[cible]`,
+    /// ligne par ligne, puis la moyenne. Seul le logarithme de la somme se
+    /// calcule par ligne : les autres probabilités ne sont pas écrites.
     fn run(&self, op: &CrossEntropy, inputs: &[&T]) -> T {
         let [logits] = operands(CrossEntropy::NAME, inputs);
-        let (n, vocab) = Self::cross_entropy_dims(logits, &op.targets);
-        let log_probabilities = self.log_softmax(logits);
-        let data = log_probabilities.data();
-        let total: f32 = op
-            .targets
-            .iter()
-            .enumerate()
-            .fold(0.0, |total, (row, &target)| {
-                total - data[row * vocab + target as usize]
-            });
+        let (n, vocab) = cross_entropy_dims(&logits.shape, &op.targets);
+        let (isa, data, targets) = (self.isa, logits.data(), &op.targets);
+        let losses = self.generate(n, (CHUNK / vocab.max(1)).max(1), |start, part| {
+            for (offset, loss) in part.iter_mut().enumerate() {
+                let row = start + offset;
+                let line = &data[row * vocab..][..vocab];
+                let max = math::max(isa, line);
+                let shift = max + math::exp_shifted_total(isa, line, max).ln();
+                *loss = shift - line[targets[row] as usize];
+            }
+        });
+        // Les pertes s'additionnent dans l'ordre des lignes.
+        let total: f32 = losses.iter().fold(0.0, |total, &loss| total + loss);
         FastTensor::new(vec![total / n as f32], &[])
     }
 
@@ -483,7 +501,7 @@ impl Run<CrossEntropy> for Fast {
     /// de la perte.
     fn run_backward(&self, op: &CrossEntropy, inputs: &[&T], _: &T, grad: &T) -> Vec<Option<T>> {
         let [logits] = operands(CrossEntropy::NAME, inputs);
-        let (n, vocab) = Self::cross_entropy_dims(logits, &op.targets);
+        let (n, vocab) = cross_entropy_dims(&logits.shape, &op.targets);
         let mut probabilities = self.softmax(logits);
         let scale = grad.data()[0] / n as f32;
         let targets = &op.targets;
@@ -647,5 +665,17 @@ impl Run<QuantizedMatmul> for Fast {
         grad: &T,
     ) -> Vec<Option<T>> {
         op.reference_backward(self, inputs, output, grad)
+    }
+
+    fn run_backward_needed(
+        &self,
+        op: &QuantizedMatmul,
+        inputs: &[&T],
+        output: &T,
+        _: Option<&T>,
+        grad: &T,
+        needed: &[bool],
+    ) -> Vec<Option<T>> {
+        op.reference_backward_needed(self, inputs, output, grad, needed)
     }
 }

@@ -3,7 +3,7 @@
 
 use rand::Rng;
 
-use super::{ExpertDims, FeedForwardKind, Linear, MixtureOfExperts, module};
+use super::{BlockShape, FeedForwardKind, Linear, MixtureOfExperts, module};
 use crate::autograd::{Tape, Var};
 use crate::backend::Backend;
 
@@ -54,14 +54,15 @@ pub struct SwiGluFeedForward<B: Backend> {
     pub proj: Linear<B>,
 }
 
-impl<B: Backend> SwiGluFeedForward<B> {
-    /// Largeur cachée : `8C/3`, arrondi au multiple de 8 supérieur.
-    pub fn hidden(dim: usize) -> usize {
-        (8 * dim).div_ceil(3).next_multiple_of(8)
-    }
+/// Largeur cachée d'un SwiGLU de dimension `dim` : `8C/3`, arrondi au
+/// multiple de 8 supérieur.
+pub fn swiglu_hidden(dim: usize) -> usize {
+    (8 * dim).div_ceil(3).next_multiple_of(8)
+}
 
+impl<B: Backend> SwiGluFeedForward<B> {
     pub fn new(backend: &B, dim: usize, proj_std: f64, rng: &mut impl Rng) -> Self {
-        Self::with_hidden(backend, dim, Self::hidden(dim), proj_std, rng)
+        Self::with_hidden(backend, dim, swiglu_hidden(dim), proj_std, rng)
     }
 
     /// Comme [`SwiGluFeedForward::new`], avec une largeur cachée choisie.
@@ -96,19 +97,14 @@ pub enum FeedForwardLayer<B: Backend> {
 }
 
 impl<B: Backend> FeedForwardLayer<B> {
-    /// Avec `experts`, un mélange d'experts ; sinon le feed-forward `kind`.
-    pub fn new(
-        backend: &B,
-        kind: FeedForwardKind,
-        experts: Option<ExpertDims>,
-        dim: usize,
-        proj_std: f64,
-        rng: &mut impl Rng,
-    ) -> Self {
-        if let Some(dims) = experts {
+    /// Un mélange d'experts si l'architecture en a un ; sinon son
+    /// feed-forward.
+    pub fn new(backend: &B, shape: &BlockShape, rng: &mut impl Rng) -> Self {
+        let (dim, proj_std) = (shape.dim, shape.proj_std());
+        if let Some(dims) = shape.architecture.experts {
             return Self::Experts(MixtureOfExperts::new(backend, dim, dims, proj_std, rng));
         }
-        match kind {
+        match shape.architecture.feed_forward {
             FeedForwardKind::Gelu => Self::Gelu(FeedForward::new(backend, dim, proj_std, rng)),
             FeedForwardKind::SwiGlu => {
                 Self::SwiGlu(SwiGluFeedForward::new(backend, dim, proj_std, rng))

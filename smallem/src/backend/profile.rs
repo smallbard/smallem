@@ -23,9 +23,13 @@ pub struct Timing {
     pub total: Duration,
 }
 
+/// Une mesure se range sous le nom de l'opération, et sous le fait qu'elle
+/// est une rétropropagation : une clé sans allocation, même à chaque appel.
+type Key = (&'static str, bool);
+
 pub struct Profiled<B> {
     inner: B,
-    timings: RefCell<BTreeMap<String, Timing>>,
+    timings: RefCell<BTreeMap<Key, Timing>>,
 }
 
 impl<B> Profiled<B> {
@@ -51,18 +55,25 @@ impl<B> Profiled<B> {
             .timings
             .borrow()
             .iter()
-            .map(|(name, &timing)| (name.clone(), timing))
+            .map(|(&(name, backward), &timing)| {
+                let name = if backward {
+                    format!("{name} (gradient)")
+                } else {
+                    name.to_string()
+                };
+                (name, timing)
+            })
             .collect();
         report.sort_by_key(|&(_, timing)| std::cmp::Reverse(timing.total));
         report
     }
 
-    fn timed<T>(&self, name: &str, operation: impl FnOnce(&B) -> T) -> T {
+    fn timed<T>(&self, key: Key, operation: impl FnOnce(&B) -> T) -> T {
         let start = Instant::now();
         let result = operation(&self.inner);
         let elapsed = start.elapsed();
         let mut timings = self.timings.borrow_mut();
-        let timing = timings.entry(name.to_string()).or_default();
+        let timing = timings.entry(key).or_default();
         timing.calls += 1;
         timing.total += elapsed;
         result
@@ -75,7 +86,7 @@ macro_rules! timed {
     ($(fn $name:ident(&self $(, $argument:ident: $type:ty)* $(,)?) $(-> $output:ty)?;)*) => {
         $(
             fn $name(&self $(, $argument: $type)*) $(-> $output)? {
-                self.timed(stringify!($name), |inner| inner.$name($($argument),*))
+                self.timed((stringify!($name), false), |inner| inner.$name($($argument),*))
             }
         )*
     };
@@ -142,11 +153,11 @@ impl<B: Primitives> Primitives for Profiled<B> {
 /// temps de l'opération est compté une fois.
 impl<B: Primitives + Run<O>, O: Operation> Run<O> for Profiled<B> {
     fn run(&self, op: &O, inputs: &[&B::Tensor]) -> B::Tensor {
-        self.timed(O::NAME, |inner| inner.run(op, inputs))
+        self.timed((O::NAME, false), |inner| inner.run(op, inputs))
     }
 
     fn run_saving(&self, op: &O, inputs: &[&B::Tensor]) -> (B::Tensor, Option<B::Tensor>) {
-        self.timed(O::NAME, |inner| inner.run_saving(op, inputs))
+        self.timed((O::NAME, false), |inner| inner.run_saving(op, inputs))
     }
 
     fn run_backward(
@@ -167,9 +178,22 @@ impl<B: Primitives + Run<O>, O: Operation> Run<O> for Profiled<B> {
         saved: Option<&B::Tensor>,
         grad: &B::Tensor,
     ) -> Vec<Option<B::Tensor>> {
-        let name = format!("{} (gradient)", O::NAME);
-        self.timed(&name, |inner| {
+        self.timed((O::NAME, true), |inner| {
             inner.run_backward_saved(op, inputs, output, saved, grad)
+        })
+    }
+
+    fn run_backward_needed(
+        &self,
+        op: &O,
+        inputs: &[&B::Tensor],
+        output: &B::Tensor,
+        saved: Option<&B::Tensor>,
+        grad: &B::Tensor,
+        needed: &[bool],
+    ) -> Vec<Option<B::Tensor>> {
+        self.timed((O::NAME, true), |inner| {
+            inner.run_backward_needed(op, inputs, output, saved, grad, needed)
         })
     }
 }

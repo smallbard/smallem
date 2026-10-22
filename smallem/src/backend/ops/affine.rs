@@ -26,27 +26,44 @@ impl Reference for Affine {
         backend.add(&backend.matmul(x, weight), bias)
     }
 
-    /// `dx = g · Wᵀ`, `dW = xᵀ · g` sommé sur le lot, `db = g` sommé sur
-    /// toutes les lignes.
     fn reference_backward<B: Primitives>(
+        &self,
+        backend: &B,
+        inputs: &[&B::Tensor],
+        output: &B::Tensor,
+        grad: &B::Tensor,
+    ) -> Vec<Option<B::Tensor>> {
+        self.reference_backward_needed(backend, inputs, output, grad, &[true; 3])
+    }
+
+    /// `dx = g · Wᵀ`, `dW = xᵀ · g` sommé sur le lot, `db = g` sommé sur
+    /// toutes les lignes ; seulement ceux qu'on attend.
+    fn reference_backward_needed<B: Primitives>(
         &self,
         backend: &B,
         inputs: &[&B::Tensor],
         _: &B::Tensor,
         grad: &B::Tensor,
+        needed: &[bool],
     ) -> Vec<Option<B::Tensor>> {
         let [x, weight, _] = operands(Self::NAME, inputs);
-        let rank = backend.shape(x).len();
-        let x_transposed = backend.transpose(x, rank - 2, rank - 1);
-        let grad_x = backend.matmul(grad, &backend.transpose(weight, 0, 1));
-        let mut grad_weight = backend.matmul(&x_transposed, grad);
-        while backend.shape(&grad_weight).len() > 2 {
-            grad_weight = backend.sum(&grad_weight, 0, false);
-        }
-        let mut grad_bias = grad.clone();
-        while backend.shape(&grad_bias).len() > 1 {
-            grad_bias = backend.sum(&grad_bias, 0, false);
-        }
-        vec![Some(grad_x), Some(grad_weight), Some(grad_bias)]
+        let grad_x = needed[0].then(|| backend.matmul(grad, &backend.transpose(weight, 0, 1)));
+        let grad_weight = needed[1].then(|| {
+            let rank = backend.shape(x).len();
+            let x_transposed = backend.transpose(x, rank - 2, rank - 1);
+            let mut grad_weight = backend.matmul(&x_transposed, grad);
+            while backend.shape(&grad_weight).len() > 2 {
+                grad_weight = backend.sum(&grad_weight, 0, false);
+            }
+            grad_weight
+        });
+        let grad_bias = needed[2].then(|| {
+            let mut grad_bias = grad.clone();
+            while backend.shape(&grad_bias).len() > 1 {
+                grad_bias = backend.sum(&grad_bias, 0, false);
+            }
+            grad_bias
+        });
+        vec![grad_x, grad_weight, grad_bias]
     }
 }

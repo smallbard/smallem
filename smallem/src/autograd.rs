@@ -89,6 +89,7 @@ trait Rule<B: Backend> {
         output: &B::Tensor,
         saved: Option<&B::Tensor>,
         grad: &B::Tensor,
+        needed: &[bool],
     ) -> Vec<Option<B::Tensor>>;
 }
 
@@ -102,8 +103,9 @@ impl<B: Backend + Run<O>, O: Operation> Rule<B> for O {
         output: &B::Tensor,
         saved: Option<&B::Tensor>,
         grad: &B::Tensor,
+        needed: &[bool],
     ) -> Vec<Option<B::Tensor>> {
-        backend.run_backward_saved(self, inputs, output, saved, grad)
+        backend.run_backward_needed(self, inputs, output, saved, grad, needed)
     }
 }
 
@@ -445,8 +447,9 @@ impl<'b, B: Backend> Tape<'b, B> {
     }
 
     /// L'attention de la génération, sur les tables du cache : voir
-    /// [`CachedAttention`]. Elle n'a pas de gradient.
-    #[allow(clippy::too_many_arguments)]
+    /// [`CachedAttention`]. Elle n'a pas de gradient : sa sortie est
+    /// enregistrée comme une constante, et ce qui la précède ne reçoit rien
+    /// à travers elle.
     pub fn cached_attention(
         &self,
         q: Var,
@@ -460,7 +463,13 @@ impl<'b, B: Backend> Tape<'b, B> {
             scale: scale.to_f64(),
             value_dim,
         };
-        self.apply(op, &[q, keys, values, step.slots, step.rows])
+        let value = {
+            let nodes = self.nodes.borrow();
+            let inputs = [q, keys, values, step.slots, step.rows];
+            let values: Vec<&B::Tensor> = inputs.iter().map(|var| &nodes[var.0].value).collect();
+            self.backend.run(&op, &values)
+        };
+        self.constant(value)
     }
 
     // --- Sélection ---
@@ -535,10 +544,13 @@ impl<'b, B: Backend> Tape<'b, B> {
         // La dérivée de la perte par rapport à elle-même vaut 1.
         grads[loss.0] = Some(backend.ones(loss_shape));
 
+        // Un parent qui ne dépend d'aucune feuille ne reçoit rien : son
+        // gradient n'est même pas calculé.
+        let needs = |var: Var| nodes[var.0].requires_grad;
         // Ajoute une contribution au gradient d'un parent. Toujours `+=` :
         // un nœud utilisé plusieurs fois reçoit plusieurs contributions.
         let accumulate = |grads: &mut Vec<Option<B::Tensor>>, var: Var, grad: B::Tensor| {
-            if !nodes[var.0].requires_grad {
+            if !needs(var) {
                 return;
             }
             grads[var.0] = Some(match grads[var.0].take() {
@@ -564,39 +576,46 @@ impl<'b, B: Backend> Tape<'b, B> {
 
                 // c = a + b  →  da = dc, db = dc
                 Op::Add(a, b) => {
-                    accumulate(
-                        &mut grads,
-                        *a,
-                        unbroadcast(backend, grad.clone(), shape(*a)),
-                    );
-                    accumulate(&mut grads, *b, unbroadcast(backend, grad, shape(*b)));
+                    if needs(*a) {
+                        let da = unbroadcast(backend, grad.clone(), shape(*a));
+                        accumulate(&mut grads, *a, da);
+                    }
+                    if needs(*b) {
+                        accumulate(&mut grads, *b, unbroadcast(backend, grad, shape(*b)));
+                    }
                 }
                 // c = a - b  →  da = dc, db = -dc
                 Op::Sub(a, b) => {
-                    accumulate(
-                        &mut grads,
-                        *a,
-                        unbroadcast(backend, grad.clone(), shape(*a)),
-                    );
-                    accumulate(
-                        &mut grads,
-                        *b,
-                        unbroadcast(backend, backend.neg(&grad), shape(*b)),
-                    );
+                    if needs(*a) {
+                        let da = unbroadcast(backend, grad.clone(), shape(*a));
+                        accumulate(&mut grads, *a, da);
+                    }
+                    if needs(*b) {
+                        let db = unbroadcast(backend, backend.neg(&grad), shape(*b));
+                        accumulate(&mut grads, *b, db);
+                    }
                 }
                 // c = a · b  →  da = dc · b, db = dc · a
                 Op::Mul(a, b) => {
-                    let da = backend.mul(&grad, value(*b));
-                    let db = backend.mul(&grad, value(*a));
-                    accumulate(&mut grads, *a, unbroadcast(backend, da, shape(*a)));
-                    accumulate(&mut grads, *b, unbroadcast(backend, db, shape(*b)));
+                    if needs(*a) {
+                        let da = backend.mul(&grad, value(*b));
+                        accumulate(&mut grads, *a, unbroadcast(backend, da, shape(*a)));
+                    }
+                    if needs(*b) {
+                        let db = backend.mul(&grad, value(*a));
+                        accumulate(&mut grads, *b, unbroadcast(backend, db, shape(*b)));
+                    }
                 }
                 // c = a / b  →  da = dc / b, db = -dc · c / b
                 Op::Div(a, b) => {
-                    let da = backend.div(&grad, value(*b));
-                    let db = backend.neg(&backend.div(&backend.mul(&grad, out), value(*b)));
-                    accumulate(&mut grads, *a, unbroadcast(backend, da, shape(*a)));
-                    accumulate(&mut grads, *b, unbroadcast(backend, db, shape(*b)));
+                    if needs(*a) {
+                        let da = backend.div(&grad, value(*b));
+                        accumulate(&mut grads, *a, unbroadcast(backend, da, shape(*a)));
+                    }
+                    if needs(*b) {
+                        let db = backend.neg(&backend.div(&backend.mul(&grad, out), value(*b)));
+                        accumulate(&mut grads, *b, unbroadcast(backend, db, shape(*b)));
+                    }
                 }
                 Op::Neg(a) => accumulate(&mut grads, *a, backend.neg(&grad)),
                 // c = exp(a)  →  da = dc · c
@@ -651,16 +670,21 @@ impl<'b, B: Backend> Tape<'b, B> {
                 }
 
                 // C = A · B  →  dA = dC · Bᵀ, dB = Aᵀ · dC
+                // Une matrice partagée par tout un lot, comme les poids d'une
+                // couche linéaire, reçoit la somme sur le lot.
                 Op::MatMul(a, b) => {
-                    let (rank_a, rank_b) = (shape(*a).len(), shape(*b).len());
-                    let b_transposed = backend.transpose(value(*b), rank_b - 2, rank_b - 1);
-                    let a_transposed = backend.transpose(value(*a), rank_a - 2, rank_a - 1);
-                    let da = backend.matmul(&grad, &b_transposed);
-                    let db = backend.matmul(&a_transposed, &grad);
-                    // Une matrice partagée par tout un lot, comme les poids
-                    // d'une couche linéaire, reçoit la somme sur le lot.
-                    accumulate(&mut grads, *a, unbroadcast(backend, da, shape(*a)));
-                    accumulate(&mut grads, *b, unbroadcast(backend, db, shape(*b)));
+                    if needs(*a) {
+                        let rank_b = shape(*b).len();
+                        let b_transposed = backend.transpose(value(*b), rank_b - 2, rank_b - 1);
+                        let da = backend.matmul(&grad, &b_transposed);
+                        accumulate(&mut grads, *a, unbroadcast(backend, da, shape(*a)));
+                    }
+                    if needs(*b) {
+                        let rank_a = shape(*a).len();
+                        let a_transposed = backend.transpose(value(*a), rank_a - 2, rank_a - 1);
+                        let db = backend.matmul(&a_transposed, &grad);
+                        accumulate(&mut grads, *b, unbroadcast(backend, db, shape(*b)));
+                    }
                 }
 
                 // y = softmax(x)  →  dx = y · (dy - Σ dy · y)
@@ -708,7 +732,9 @@ impl<'b, B: Backend> Tape<'b, B> {
                     saved,
                 } => {
                     let values: Vec<&B::Tensor> = inputs.iter().map(|var| value(*var)).collect();
-                    let input_grads = rule.backward(backend, &values, out, saved.as_ref(), &grad);
+                    let needed: Vec<bool> = inputs.iter().map(|var| needs(*var)).collect();
+                    let input_grads =
+                        rule.backward(backend, &values, out, saved.as_ref(), &grad, &needed);
                     assert_eq!(
                         input_grads.len(),
                         inputs.len(),
@@ -1162,6 +1188,84 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert_eq!(gradients(true), gradients(false));
+    }
+
+    #[test]
+    fn a_frozen_weight_changes_no_other_gradient() {
+        // Des poids constants, comme ceux d'un modèle sous un adaptateur :
+        // leur gradient n'est pas calculé, les autres sont les mêmes.
+        let backend = Cpu::new();
+        let mut rng = StdRng::seed_from_u64(6);
+        let inputs = [
+            T::randn(&[2, 3, 4], &mut rng),
+            T::randn(&[4, 5], &mut rng),
+            T::randn(&[5], &mut rng),
+        ];
+        let gradients = |frozen: bool| {
+            let tape = Tape::new(&backend);
+            let x = tape.leaf(inputs[0].clone());
+            let weight = if frozen {
+                tape.constant(inputs[1].clone())
+            } else {
+                tape.leaf(inputs[1].clone())
+            };
+            let bias = tape.leaf(inputs[2].clone());
+            let out = tape.mul(tape.affine(x, weight, bias), tape.matmul(x, weight));
+            let grads = tape.backward(weighted_sum(&tape, out));
+            assert_eq!(grads.get(weight).is_none(), frozen);
+            [x, bias].map(|var| grads.get(var).unwrap().data().to_vec())
+        };
+        assert_eq!(gradients(true), gradients(false));
+    }
+
+    #[test]
+    fn quantized_matmul_passes_the_gradient_to_its_input_and_bias() {
+        use crate::quantize::Format;
+        let mut rng = StdRng::seed_from_u64(8);
+        let dequantized = T::randn(&[4, 3], &mut rng);
+        // Le backend de référence ne lit que les poids déquantifiés.
+        let quantized = QuantizedWeight {
+            format: Format::Int8,
+            words: T::zeros(&[1, 3]),
+            scales: T::zeros(&[1, 3]),
+        };
+        gradcheck(&[&[2, 5, 4], &[3]], |t, v| {
+            let weight = t.constant(dequantized.clone());
+            t.quantized_matmul(v[0], &quantized, weight, Some(v[1]))
+        });
+        // Des poids déquantifiés rangés comme un paramètre ne reçoivent
+        // rien, et la rétropropagation ne panique pas.
+        let backend = Cpu::new();
+        let tape = Tape::new(&backend);
+        let x = tape.leaf(T::randn(&[2, 4], &mut rng));
+        let weight = tape.leaf(dequantized.clone());
+        let out = tape.quantized_matmul(x, &quantized, weight, None);
+        let grads = tape.backward(tape.sum_all(out));
+        assert!(grads.get(x).is_some());
+        assert!(grads.get(weight).is_none());
+    }
+
+    #[test]
+    fn cached_attention_lets_no_gradient_through() {
+        let backend = Cpu::new();
+        let tape = Tape::new(&backend);
+        let mut rng = StdRng::seed_from_u64(9);
+        let q = tape.leaf(T::randn(&[1, 2, 4], &mut rng));
+        let table = tape.leaf(T::randn(&[3, 2, 4], &mut rng));
+        let step = CacheStep {
+            capacity: 3,
+            lines: tape.constant(T::from_vec(vec![2.0], &[1])),
+            slots: tape.constant(T::from_vec(vec![0.0, 1.0, 2.0], &[1, 3])),
+            rows: tape.constant(T::from_vec(vec![0.0, 3.0], &[1, 2])),
+            rope: None,
+            rope_single: None,
+        };
+        let out = tape.cached_attention(q, table, table, &step, 0.5, None);
+        let loss = tape.add(tape.sum_all(out), tape.sum_all(q));
+        let grads = tape.backward(loss);
+        // `q` ne reçoit que le gradient de la somme directe.
+        assert_eq!(grads.get(q).unwrap().data(), &[1.0; 8]);
+        assert!(grads.get(table).is_none());
     }
 
     #[test]

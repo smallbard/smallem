@@ -170,7 +170,10 @@ impl Quantized {
     /// Comme dans l'article, un amortissement de 1 % de la moyenne de la
     /// diagonale est ajouté au hessien, et les échelles d'un groupe sont
     /// fixées quand on atteint sa première ligne, d'après les poids déjà
-    /// corrigés.
+    /// corrigés. Le hessien est en théorie semi-défini positif, mais les
+    /// arrondis peuvent le rendre indéfini : si l'amortissement ne suffit
+    /// pas, il est décuplé, jusqu'à 100 %. Au-delà, le hessien n'est pas un
+    /// hessien (des `NaN`, par exemple) et la fonction panique.
     pub fn gptq(weight: &[f64], rows: usize, cols: usize, format: Format, hessian: &[f64]) -> Self {
         assert_eq!(weight.len(), rows * cols, "poids de forme inattendue");
         assert_eq!(hessian.len(), rows * rows, "hessien de forme inattendue");
@@ -185,12 +188,17 @@ impl Quantized {
             }
         }
         let mean = (0..rows).map(|k| h[k * rows + k]).sum::<f64>() / rows as f64;
-        for k in 0..rows {
-            h[k * rows + k] += 0.01 * mean;
-        }
-        let inverse = invert_symmetric(&h, rows);
-        // `H⁻¹ = L · Lᵀ`, donc `U = Lᵀ`, rangé ici par lignes de `L`.
-        let lower = cholesky(&inverse, rows);
+        let lower = [0.01, 0.1, 1.0]
+            .into_iter()
+            .find_map(|damping| {
+                let mut damped = h.clone();
+                for k in 0..rows {
+                    damped[k * rows + k] += damping * mean;
+                }
+                // `H⁻¹ = L · Lᵀ`, donc `U = Lᵀ`, rangé ici par lignes de `L`.
+                cholesky(&invert_symmetric(&damped, rows).ok()?, rows).ok()
+            })
+            .expect("hessien inutilisable, même amorti de 100 %");
         let u = |k: usize, j: usize| lower[j * rows + k];
 
         let (group, groups, _) = Self::layout(format, rows);
@@ -298,30 +306,33 @@ impl Quantized {
 
 /// Le facteur de Cholesky `L` d'une matrice symétrique définie positive
 /// `[n, n]` : `a = L · Lᵀ`, `L` triangulaire inférieure, rangée par lignes.
-pub fn cholesky(a: &[f64], n: usize) -> Vec<f64> {
+/// Une matrice qui n'est pas définie positive donne une erreur.
+fn cholesky(a: &[f64], n: usize) -> Result<Vec<f64>, String> {
     let mut l = vec![0.0; n * n];
     for i in 0..n {
         for j in 0..=i {
             let dot: f64 = (0..j).map(|k| l[i * n + k] * l[j * n + k]).sum();
             if i == j {
                 let pivot = a[i * n + i] - dot;
-                assert!(
-                    pivot > 0.0,
-                    "matrice non définie positive (pivot {pivot} en {i})"
-                );
+                // Un `NaN` est refusé lui aussi.
+                if pivot.is_nan() || pivot <= 0.0 {
+                    return Err(format!(
+                        "matrice non définie positive (pivot {pivot} en {i})"
+                    ));
+                }
                 l[i * n + i] = pivot.sqrt();
             } else {
                 l[i * n + j] = (a[i * n + j] - dot) / l[j * n + j];
             }
         }
     }
-    l
+    Ok(l)
 }
 
 /// L'inverse d'une matrice symétrique définie positive `[n, n]`, par son
 /// facteur de Cholesky : `a⁻¹ = L⁻ᵀ · L⁻¹`.
-pub fn invert_symmetric(a: &[f64], n: usize) -> Vec<f64> {
-    let l = cholesky(a, n);
+fn invert_symmetric(a: &[f64], n: usize) -> Result<Vec<f64>, String> {
+    let l = cholesky(a, n)?;
     // `L⁻¹`, triangulaire inférieure, colonne par colonne.
     let mut inverse_l = vec![0.0; n * n];
     for col in 0..n {
@@ -344,7 +355,7 @@ pub fn invert_symmetric(a: &[f64], n: usize) -> Vec<f64> {
             inverse[j * n + i] = dot;
         }
     }
-    inverse
+    Ok(inverse)
 }
 
 #[cfg(test)]
@@ -448,20 +459,48 @@ mod tests {
     #[test]
     fn cholesky_and_inverse_are_exact() {
         let a = [4.0, 2.0, 0.4, 2.0, 3.0, 0.5, 0.4, 0.5, 2.0];
-        let l = cholesky(&a, 3);
+        let l = cholesky(&a, 3).unwrap();
         for i in 0..3 {
             for j in 0..3 {
                 let product: f64 = (0..3).map(|k| l[i * 3 + k] * l[j * 3 + k]).sum();
                 assert!((product - a[i * 3 + j]).abs() < 1e-12);
             }
         }
-        let inverse = invert_symmetric(&a, 3);
+        let inverse = invert_symmetric(&a, 3).unwrap();
         for i in 0..3 {
             for j in 0..3 {
                 let product: f64 = (0..3).map(|k| a[i * 3 + k] * inverse[k * 3 + j]).sum();
                 assert!((product - f64::from(u8::from(i == j))).abs() < 1e-12);
             }
         }
+    }
+
+    #[test]
+    fn an_indefinite_matrix_is_an_error_not_a_panic() {
+        // Valeurs propres 2,02 et −0,02 : indéfinie.
+        let a = [1.0, 1.02, 1.02, 1.0];
+        assert!(
+            cholesky(&a, 2)
+                .unwrap_err()
+                .contains("non définie positive")
+        );
+        assert!(invert_symmetric(&a, 2).is_err());
+        assert!(cholesky(&[f64::NAN], 1).is_err());
+    }
+
+    #[test]
+    fn gptq_damps_more_when_the_hessian_is_slightly_indefinite() {
+        // L'amortissement de 1 % (0,01) ne suffit pas, celui de 10 % oui.
+        let hessian = [1.0, 1.02, 1.02, 1.0];
+        let weight = [0.3, -0.2, 0.1, 0.4];
+        let quantized = Quantized::gptq(&weight, 2, 2, Format::Int8, &hessian);
+        let error: f64 = quantized
+            .dequantize()
+            .iter()
+            .zip(weight)
+            .map(|(q, w)| (q - w).abs())
+            .fold(0.0, f64::max);
+        assert!(error < 0.01, "{error}");
     }
 
     #[test]

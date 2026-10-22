@@ -119,8 +119,8 @@ pub(crate) fn forward(
         value_dim,
     } = dims;
     let tiles = queries.div_ceil(QUERIES);
-    let mut out = Buffer::uninit(matrices * queries * value_dim);
-    let mut log_sum = Buffer::uninit(matrices * queries);
+    let mut out = Buffer::any(matrices * queries * value_dim);
+    let mut log_sum = Buffer::any(matrices * queries);
     let shared_out = super::pool::SharedMut::new(&mut out);
     let shared_log = super::pool::SharedMut::new(&mut log_sum);
     let isa = fast.isa();
@@ -133,6 +133,7 @@ pub(crate) fn forward(
         let v = &v.data()[matrix * positions * value_dim..][..positions * value_dim];
         // SAFETY : chaque tâche écrit ses propres lignes.
         let o = unsafe { shared_out.slice((matrix * queries + row) * value_dim, rows * value_dim) };
+        // SAFETY : de même pour les sommes des exponentielles.
         let l_out = unsafe { shared_log.slice(matrix * queries + row, rows) };
         o.fill(0.0);
         let mut max = [f32::NEG_INFINITY; QUERIES];
@@ -220,9 +221,9 @@ pub(crate) fn backward(
         value_dim,
     } = dims;
     let isa = fast.isa();
-    let mut grad_q = Buffer::uninit(q.len());
-    let mut grad_k = Buffer::uninit(k.len());
-    let mut grad_v = Buffer::uninit(v.len());
+    let mut grad_q = Buffer::any(q.len());
+    let mut grad_k = Buffer::any(k.len());
+    let mut grad_v = Buffer::any(v.len());
     let (shared_q, shared_k, shared_v) = (
         super::pool::SharedMut::new(&mut grad_q),
         super::pool::SharedMut::new(&mut grad_k),
@@ -240,7 +241,9 @@ pub(crate) fn backward(
         let l = &log_sum.data()[matrix * queries..][..queries];
         // SAFETY : chaque tâche écrit sa propre matrice.
         let dq = unsafe { shared_q.slice(matrix * queries * key_dim, queries * key_dim) };
+        // SAFETY : de même pour les gradients des clés et des valeurs.
         let dk = unsafe { shared_k.slice(matrix * positions * key_dim, positions * key_dim) };
+        // SAFETY : idem.
         let dv = unsafe { shared_v.slice(matrix * positions * value_dim, positions * value_dim) };
         dq.fill(0.0);
         dk.fill(0.0);

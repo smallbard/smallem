@@ -5,7 +5,7 @@ use rand::Rng;
 
 use super::{Parameter, module};
 use crate::autograd::{Tape, Var};
-use crate::backend::{Backend, Float};
+use crate::backend::Backend;
 
 /// Une correction `ΔW = A · B` d'une matrice `W` `[entrée, sortie]`, avec
 /// `A` `[entrée, r]` et `B` `[r, sortie]`, et `r` bien plus petit que les
@@ -40,22 +40,11 @@ impl<B: Backend> Adapter<B> {
         tape.matmul(self.down.var(tape), self.up.var(tape))
     }
 
-    /// Nombre de paramètres entraînés.
-    pub fn len(&self, backend: &B) -> usize {
-        let count = |p: &Parameter<B>| backend.shape(p.value()).iter().product::<usize>();
-        count(&self.down) + count(&self.up)
-    }
-
-    pub fn is_empty(&self, backend: &B) -> bool {
-        self.len(backend) == 0
-    }
-
     /// Ajoute la correction à `weight`, sur place : `W ← W + A · B`.
     pub fn merge_into(&self, backend: &B, weight: &mut Parameter<B>) {
         let delta = backend.matmul(self.down.value(), self.up.value());
         let merged = backend.add(weight.value(), &delta);
-        *weight.value_mut() = merged;
-        let _ = B::Scalar::ONE;
+        weight.set_value(merged);
     }
 }
 

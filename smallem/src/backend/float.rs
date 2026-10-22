@@ -124,3 +124,39 @@ pub fn silu_slope<F: Float>(x: F) -> F {
     let s = sigmoid(x);
     s * (F::ONE + x * (F::ONE - s))
 }
+
+/// Les réglages d'un pas d'AdamW, dans le type des éléments : voir
+/// [`AdamWStep`](super::AdamWStep), qui les donne en `f64`.
+#[derive(Clone, Copy, Debug)]
+pub struct AdamWScalars<F> {
+    pub learning_rate: F,
+    pub beta1: F,
+    pub beta2: F,
+    pub epsilon: F,
+    pub weight_decay: F,
+    pub correction1: F,
+    pub correction2: F,
+    pub grad_scale: F,
+}
+
+/// Un pas d'AdamW sur un élément : le paramètre `param`, son gradient
+/// `grad`, ses moments `m` et `v`. Rend le paramètre et les moments mis à
+/// jour :
+///
+/// ```text
+/// g = grad × grad_scale
+/// m = β₁·m + (1 - β₁)·g
+/// v = β₂·v + (1 - β₂)·g²
+/// param -= lr × ( (m / c₁) / (√(v / c₂) + ε) + décroissance × param )
+/// ```
+///
+/// Comme [`gelu`], la formule est écrite une fois pour tous les backends.
+#[inline(always)]
+pub fn adamw_update<F: Float>(param: F, grad: F, m: F, v: F, step: &AdamWScalars<F>) -> (F, F, F) {
+    let g = grad * step.grad_scale;
+    let m = step.beta1 * m + (F::ONE - step.beta1) * g;
+    let v = step.beta2 * v + (F::ONE - step.beta2) * g * g;
+    let update = (m / step.correction1) / ((v / step.correction2).sqrt() + step.epsilon);
+    let param = param - step.learning_rate * (update + step.weight_decay * param);
+    (param, m, v)
+}

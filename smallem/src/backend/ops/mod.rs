@@ -15,8 +15,16 @@
 //!
 //! Un backend sait exécuter l'opération `O` s'il implémente [`Run<O>`].
 //! Quand l'opération s'écrit avec les primitives, elle fournit cette
-//! écriture ([`Reference`]) : le backend CPU s'en sert telle quelle, et le
-//! backend GPU, qui a un kernel dédié, est testé contre elle.
+//! écriture ([`Reference`]) : le backend CPU s'en sert telle quelle, et les
+//! autres backends, qui ont un kernel dédié, sont testés contre elle.
+//!
+//! Quelques opérations n'ont pas d'écriture avec les primitives, ou une
+//! écriture que le backend CPU remplace par une boucle directe sur les
+//! éléments (GELU, SiLU, la rotation, l'entropie croisée) : elles
+//! implémentent `Run` pour `Cpu` elles-mêmes, dans leur fichier. Ces deux
+//! façons ne peuvent pas se cumuler : une opération qui implémente
+//! [`Reference`] reçoit `Run` pour `Cpu` de l'implémentation générique
+//! ci-dessous, et ne doit pas l'écrire à la main.
 //!
 //! Ajouter une opération, c'est ajouter un fichier ici et une ligne à la
 //! liste de [`Backend`](super::Backend). L'autograd et le profileur n'ont
@@ -51,10 +59,10 @@ pub use silu::Silu;
 pub use transposed_matmul::TransposedMatmul;
 
 use super::cpu::Cpu;
+use super::{Float, Primitives};
 
 #[cfg(test)]
 mod tests;
-use super::{Float, Primitives};
 
 /// Une opération : un calcul nommé, avec ses réglages.
 pub trait Operation: 'static {
@@ -103,6 +111,27 @@ pub trait Run<O: Operation>: Primitives {
     ) -> Vec<Option<Self::Tensor>> {
         self.run_backward(op, inputs, output, grad)
     }
+
+    /// Comme [`Run::run_backward_saved`], en sachant quelles entrées
+    /// attendent un gradient : `needed[i]` pour l'entrée `i`. C'est ce
+    /// qu'appelle la tape.
+    ///
+    /// Par défaut, tous les gradients sont calculés, et la tape jette ceux
+    /// qui ne servent pas. Une opération dont un gradient coûte un produit
+    /// matriciel, comme celui des poids figés d'une couche affine, s'en
+    /// dispense en rendant `None` à sa place.
+    fn run_backward_needed(
+        &self,
+        op: &O,
+        inputs: &[&Self::Tensor],
+        output: &Self::Tensor,
+        saved: Option<&Self::Tensor>,
+        grad: &Self::Tensor,
+        needed: &[bool],
+    ) -> Vec<Option<Self::Tensor>> {
+        let _ = needed;
+        self.run_backward_saved(op, inputs, output, saved, grad)
+    }
 }
 
 /// Une opération qui s'écrit avec les seules primitives.
@@ -119,6 +148,20 @@ pub trait Reference: Operation {
         output: &B::Tensor,
         grad: &B::Tensor,
     ) -> Vec<Option<B::Tensor>>;
+
+    /// Comme [`Reference::reference_backward`], sans les gradients dont
+    /// `needed` dit qu'ils ne servent pas (voir [`Run::run_backward_needed`]).
+    fn reference_backward_needed<B: Primitives>(
+        &self,
+        backend: &B,
+        inputs: &[&B::Tensor],
+        output: &B::Tensor,
+        grad: &B::Tensor,
+        needed: &[bool],
+    ) -> Vec<Option<B::Tensor>> {
+        let _ = needed;
+        self.reference_backward(backend, inputs, output, grad)
+    }
 }
 
 /// Le backend CPU exécute la définition de référence, sans rien y ajouter.
@@ -135,6 +178,18 @@ impl<F: Float, O: Reference> Run<O> for Cpu<F> {
         grad: &Self::Tensor,
     ) -> Vec<Option<Self::Tensor>> {
         op.reference_backward(self, inputs, output, grad)
+    }
+
+    fn run_backward_needed(
+        &self,
+        op: &O,
+        inputs: &[&Self::Tensor],
+        output: &Self::Tensor,
+        _: Option<&Self::Tensor>,
+        grad: &Self::Tensor,
+        needed: &[bool],
+    ) -> Vec<Option<Self::Tensor>> {
+        op.reference_backward_needed(self, inputs, output, grad, needed)
     }
 }
 

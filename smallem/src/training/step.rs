@@ -86,31 +86,7 @@ pub fn train_step_accumulated<B: Backend, M: Module<B>>(
     optimizer: &mut impl Optimizer<B>,
     max_norm: f64,
     micro_batches: usize,
-    loss: impl FnMut(&M, &Tape<B>, usize) -> Var,
-) -> (B::Tensor, f64) {
-    train_step_observed(
-        backend,
-        model,
-        optimizer,
-        max_norm,
-        micro_batches,
-        loss,
-        |_, _, _| {},
-    )
-}
-
-/// [`train_step_accumulated`], qui montre en plus à `observe` les gradients
-/// de chaque lot, avec le numéro de sa tape : de quoi récupérer ceux que
-/// l'optimiseur du modèle ne voit pas, comme ceux d'une mémoire de
-/// n-grammes creuse.
-pub fn train_step_observed<B: Backend, M: Module<B>>(
-    backend: &B,
-    model: &mut M,
-    optimizer: &mut impl Optimizer<B>,
-    max_norm: f64,
-    micro_batches: usize,
     mut loss: impl FnMut(&M, &Tape<B>, usize) -> Var,
-    mut observe: impl FnMut(&mut M, u64, &Gradients<B>),
 ) -> (B::Tensor, f64) {
     assert!(micro_batches > 0, "il faut au moins un lot");
     let mut grad_sums: Vec<Option<B::Tensor>> = vec![None; model.parameters().len()];
@@ -118,7 +94,6 @@ pub fn train_step_observed<B: Backend, M: Module<B>>(
     for index in 0..micro_batches {
         let (loss_value, tape_id, grads) =
             loss_and_gradients(backend, model, |m, t| loss(m, t, index));
-        observe(model, tape_id, &grads);
         for (sum, parameter) in grad_sums.iter_mut().zip(model.parameters()) {
             let Some(grad) = parameter.grad(tape_id, &grads) else {
                 continue;
@@ -150,17 +125,23 @@ pub fn train_step_observed<B: Backend, M: Module<B>>(
 }
 
 /// Passe avant puis rétropropagation, sur une tape qui est jetée ensuite.
-fn loss_and_gradients<B: Backend, M>(
+/// Le modèle garde au passage les gradients qui échappent à l'optimiseur
+/// ([`Module::collect_gradients`]).
+fn loss_and_gradients<B: Backend, M: Module<B>>(
     backend: &B,
-    model: &M,
+    model: &mut M,
     loss: impl FnOnce(&M, &Tape<B>) -> Var,
 ) -> (B::Tensor, u64, Gradients<B>) {
     // La tape référence les paramètres : elle doit avoir disparu quand
     // l'optimiseur les modifie sur place.
-    let tape = Tape::new(backend);
-    let loss = loss(model, &tape);
-    let grads = tape.backward(loss);
-    (tape.value(loss).clone(), tape.id(), grads)
+    let (loss_value, tape_id, grads) = {
+        let tape = Tape::new(backend);
+        let loss = loss(model, &tape);
+        let grads = tape.backward(loss);
+        (tape.value(loss).clone(), tape.id(), grads)
+    };
+    model.collect_gradients(tape_id, &grads);
+    (loss_value, tape_id, grads)
 }
 
 /// Calcule une perte sans rien apprendre : pas de rétropropagation, pas de
@@ -180,22 +161,13 @@ mod tests {
     use super::*;
     use crate::backend::Primitives;
     use crate::backend::cpu::Cpu;
-    use crate::model::{Gpt, GptConfig};
-    use crate::nn::Architecture;
+    use crate::model::Gpt;
+    use crate::model::tests::TINY;
     use crate::optim::AdamW;
     use rand::SeedableRng;
     use rand::rngs::StdRng;
 
     type B = Cpu<f64>;
-
-    const TINY: GptConfig = GptConfig {
-        vocab: 11,
-        context: 4,
-        layers: 1,
-        heads: 2,
-        embed: 8,
-        architecture: Architecture::GPT2,
-    };
 
     /// Quatre séquences de quatre tokens et leurs cibles.
     const TOKENS: [u32; 16] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 0, 1, 3, 5, 7, 9];

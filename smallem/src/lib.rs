@@ -1,3 +1,16 @@
+//! Un modèle de langage de type GPT, écrit à partir de zéro.
+//!
+//! Les modules, du texte au modèle entraîné :
+//!
+//! - le texte : [`corpus`], [`tokenizer`], [`data`], [`ngram`] ;
+//! - le calcul : [`backend`], [`autograd`], [`flops`] ;
+//! - les modèles : [`nn`], [`model`], [`mlp`], [`gpt2`], [`io`] ;
+//! - l'entraînement : [`optim`], [`training`], [`scaling`] ;
+//! - la génération : [`cache`], [`generation`], [`sampling`],
+//!   [`speculative`], [`quantize`] ;
+//! - le post-entraînement : [`chat`], [`tasks`], [`post_training`] ;
+//! - les programmes : [`cli`].
+
 pub mod autograd;
 pub mod backend;
 pub mod cache;

@@ -18,7 +18,11 @@ use std::path::Path;
 
 use serde_json::{Map, Value, json};
 
+use rand::SeedableRng;
+use rand::rngs::StdRng;
+
 use crate::backend::{Backend, Float};
+use crate::model::{Gpt, GptConfig};
 use crate::nn::Module;
 use crate::optim::{Optimizer, OptimizerState};
 
@@ -148,14 +152,19 @@ impl SafeTensors {
                 bytes.extend(value.to_le_bytes());
             }
         }
-        // Écrire à côté puis renommer : une sauvegarde interrompue ne
-        // détruit pas le fichier précédent.
-        let path = path.as_ref();
-        let temporary = path.with_extension("safetensors.tmp");
-        fs::write(&temporary, bytes)?;
-        fs::rename(temporary, path)?;
-        Ok(())
+        Ok(write_atomically(path, &bytes)?)
     }
+}
+
+/// Écrit `bytes` à côté de `path`, puis renomme : une sauvegarde
+/// interrompue ne détruit pas le fichier précédent.
+pub(crate) fn write_atomically(path: impl AsRef<Path>, bytes: &[u8]) -> std::io::Result<()> {
+    let path = path.as_ref();
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".tmp");
+    let temporary = path.with_file_name(name);
+    fs::write(&temporary, bytes)?;
+    fs::rename(temporary, path)
 }
 
 /// Rapatrie un tenseur sur l'hôte.
@@ -260,6 +269,38 @@ pub fn load_parameters<B: Backend, M: Module<B>>(
     Ok(())
 }
 
+/// Le modèle enregistré dans `file` : sa configuration, lue dans les
+/// métadonnées, puis ses poids. Avec `inference`, sans ce qui ne sert qu'à
+/// l'entraînement (le module de prédiction multi-token, que le fichier peut
+/// contenir : [`GptConfig::for_inference`]).
+///
+/// Les poids tirés à la construction sont aussitôt remplacés : ils ont leur
+/// propre générateur, à graine fixe, pour que rien d'autre n'en dépende.
+pub fn gpt_from_file<B: Backend>(
+    backend: &B,
+    file: &SafeTensors,
+    inference: bool,
+) -> Result<Gpt<B>, Box<dyn Error>> {
+    let mut config = GptConfig::from_metadata(&file.metadata)?;
+    if inference {
+        config = config.for_inference();
+    }
+    let mut model = Gpt::new(backend, config, &mut StdRng::seed_from_u64(0));
+    load_parameters(file, backend, &mut model)?;
+    Ok(model)
+}
+
+/// Lit le fichier `path` et en fait un modèle : voir [`gpt_from_file`].
+pub fn load_gpt<B: Backend>(
+    backend: &B,
+    path: impl AsRef<Path>,
+    inference: bool,
+) -> Result<Gpt<B>, Box<dyn Error>> {
+    let path = path.as_ref();
+    let file = SafeTensors::read(path).map_err(|error| format!("{} : {error}", path.display()))?;
+    gpt_from_file(backend, &file, inference)
+}
+
 /// Enregistre un point de reprise : les paramètres, comme [`save_model`],
 /// plus l'état de l'optimiseur. Sans ses moyennes glissantes, un
 /// entraînement repris ferait de mauvais premiers pas.
@@ -271,7 +312,7 @@ pub fn load_parameters<B: Backend, M: Module<B>>(
 ///
 /// Le fichier reste un fichier de poids ordinaire : [`load_parameters`] le
 /// lit en ignorant ce qui concerne l'optimiseur.
-pub fn save_checkpoint<B: Backend, M: Module<B>>(
+pub(crate) fn save_checkpoint<B: Backend, M: Module<B>>(
     path: impl AsRef<Path>,
     backend: &B,
     model: &M,
@@ -294,7 +335,7 @@ pub fn save_checkpoint<B: Backend, M: Module<B>>(
 }
 
 /// Recharge un point de reprise dans un modèle et un optimiseur.
-pub fn load_checkpoint<B: Backend, M: Module<B>>(
+pub(crate) fn load_checkpoint<B: Backend, M: Module<B>>(
     file: &SafeTensors,
     backend: &B,
     model: &mut M,
@@ -333,24 +374,18 @@ pub fn load_checkpoint<B: Backend, M: Module<B>>(
 mod tests {
     use super::*;
     use crate::backend::cpu::Cpu;
-    use crate::model::{Gpt, GptConfig};
-    use crate::nn::Architecture;
     use crate::optim::AdamW;
     use crate::training::train_step;
-    use rand::SeedableRng;
-    use rand::rngs::StdRng;
 
     fn temporary(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!("smallem-{name}-{}.safetensors", std::process::id()))
     }
 
+    /// Le modèle minuscule des tests, avec deux couches : les noms des
+    /// paramètres de plusieurs blocs se distinguent.
     const TINY: GptConfig = GptConfig {
-        vocab: 11,
-        context: 4,
         layers: 2,
-        heads: 2,
-        embed: 8,
-        architecture: Architecture::GPT2,
+        ..crate::model::tests::TINY
     };
 
     #[test]
@@ -587,5 +622,28 @@ mod tests {
         let error =
             load_checkpoint(&file, &backend, &mut model, &mut AdamW::new(1e-2, 0.1)).unwrap_err();
         assert!(error.to_string().contains("point de reprise"), "{error}");
+    }
+
+    #[test]
+    fn a_saved_model_comes_back_whole() {
+        let backend = Cpu::<f32>::new();
+        let model = Gpt::new(&backend, TINY, &mut StdRng::seed_from_u64(1));
+        let path = temporary("load-gpt");
+        save_model(&path, &backend, &model, TINY.to_metadata()).unwrap();
+        let loaded = load_gpt(&backend, &path, true);
+        fs::remove_file(&path).unwrap();
+        let loaded = loaded.unwrap();
+        assert_eq!(loaded.config(), model.config());
+        assert!(
+            model
+                .parameters()
+                .iter()
+                .zip(loaded.parameters())
+                .all(|(a, b)| a.value() == b.value())
+        );
+        let Err(missing) = load_gpt(&backend, temporary("absent"), true) else {
+            panic!("un fichier absent ne donne pas de modèle");
+        };
+        assert!(missing.to_string().contains("absent"), "{missing}");
     }
 }

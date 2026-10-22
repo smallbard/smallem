@@ -49,6 +49,22 @@ pub struct AdamWStep {
     pub grad_scale: f64,
 }
 
+impl AdamWStep {
+    /// Les mêmes réglages, convertis dans le type des éléments.
+    pub fn scalars<F: Float>(&self) -> float::AdamWScalars<F> {
+        float::AdamWScalars {
+            learning_rate: F::from_f64(self.learning_rate),
+            beta1: F::from_f64(self.beta1),
+            beta2: F::from_f64(self.beta2),
+            epsilon: F::from_f64(self.epsilon),
+            weight_decay: F::from_f64(self.weight_decay),
+            correction1: F::from_f64(self.bias_correction1),
+            correction2: F::from_f64(self.bias_correction2),
+            grad_scale: F::from_f64(self.grad_scale),
+        }
+    }
+}
+
 /// Un endroit où vivent des tenseurs, et les opérations élémentaires qu'on
 /// peut leur appliquer : les primitives.
 ///
@@ -209,8 +225,6 @@ pub trait Primitives {
     /// doivent être les mêmes.
     fn concat_rows(&self, a: &Self::Tensor, b: &Self::Tensor) -> Self::Tensor;
 
-    // --- Perte ---
-
     // --- Mises à jour sur place ---
     //
     // Les seules opérations qui modifient un tenseur existant : l'écriture
@@ -233,14 +247,8 @@ pub trait Primitives {
     /// Descente de gradient : `param -= learning_rate × grad`.
     fn sgd_step(&self, param: &mut Self::Tensor, grad: &Self::Tensor, learning_rate: f64);
 
-    /// Un pas d'AdamW, qui met à jour le paramètre et ses deux moments :
-    ///
-    /// ```text
-    /// g = grad × grad_scale
-    /// m = β₁·m + (1 - β₁)·g
-    /// v = β₂·v + (1 - β₂)·g²
-    /// param -= lr × ( (m / c₁) / (√(v / c₂) + ε) + décroissance × param )
-    /// ```
+    /// Un pas d'AdamW, qui met à jour le paramètre et ses deux moments,
+    /// élément par élément : voir [`float::adamw_update`].
     fn adamw_step(
         &self,
         param: &mut Self::Tensor,

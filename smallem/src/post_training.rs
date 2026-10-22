@@ -209,10 +209,10 @@ pub fn sft_batch(
     }
 }
 
-/// La somme des log-probabilités des tokens `tokens[start..]` de chaque
-/// séquence, sachant ceux qui les précèdent : la log-probabilité d'une
-/// réponse. Les séquences sont `[batch, T]`, mises bout à bout ; `scored`
-/// marque les positions dont la cible compte. Rend `[batch]`.
+/// La somme des log-probabilités des cibles notées de chaque séquence,
+/// sachant ce qui les précède : la log-probabilité d'une réponse. Les
+/// séquences sont `[batch, T]`, mises bout à bout ; `scored` marque les
+/// positions dont la cible compte. Rend `[batch]`.
 pub fn sequence_log_probs<B: Backend>(
     tape: &Tape<B>,
     model: &Gpt<B>,
@@ -221,25 +221,16 @@ pub fn sequence_log_probs<B: Backend>(
     scored: &[bool],
     batch: usize,
 ) -> Var {
-    let length = tokens.len() / batch;
-    let vocab = model.config().vocab;
-    let logits = model.logits(tape, tokens, batch);
-    let flat = tape.reshape(logits, &[tokens.len(), vocab]);
-    let log_probs = tape.log_softmax(flat);
-    // Pour chaque position notée, la log-probabilité de sa cible, puis la
-    // somme par séquence : une matrice `[batch, positions notées]` de 0 et
-    // de 1.
-    let rows: Vec<u32> = (0..tokens.len() as u32)
-        .filter(|&i| scored[i as usize])
-        .collect();
-    let per_position = target_log_probs(tape, log_probs, &rows, targets, vocab);
-    let backend = tape.backend();
-    let mut owner = vec![B::Scalar::ZERO; batch * rows.len()];
-    for (i, &row) in rows.iter().enumerate() {
-        owner[(row as usize / length) * rows.len() + i] = B::Scalar::ONE;
+    let (per_position, owners) = token_log_probs(tape, model, tokens, targets, scored, batch);
+    // La somme par séquence, en un produit : une matrice `[batch, n]` de 0
+    // et de 1, dont la ligne d'une séquence marque ses positions notées.
+    let n = owners.len();
+    let mut owner = vec![B::Scalar::ZERO; batch * n];
+    for (i, &sequence) in owners.iter().enumerate() {
+        owner[sequence * n + i] = B::Scalar::ONE;
     }
-    let owner = tape.constant(backend.from_vec(owner, &[batch, rows.len()]));
-    let per_position = tape.reshape(per_position, &[rows.len(), 1]);
+    let owner = tape.constant(tape.backend().from_vec(owner, &[batch, n]));
+    let per_position = tape.reshape(per_position, &[n, 1]);
     tape.reshape(tape.matmul(owner, per_position), &[batch])
 }
 

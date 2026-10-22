@@ -43,6 +43,16 @@ impl Args {
     }
 }
 
+/// Un argument qui n'est pas une option : refuse ce qui commence par `--`,
+/// pour qu'une option mal écrite ne soit pas prise pour un fichier.
+pub fn positional(arg: &str) -> Result<&str, Box<dyn Error>> {
+    if arg.starts_with("--") {
+        Err(format!("option inconnue : {arg}").into())
+    } else {
+        Ok(arg)
+    }
+}
+
 impl Iterator for Args {
     type Item = String;
 
@@ -94,5 +104,13 @@ mod tests {
             invalid.starts_with("--steps : valeur `beaucoup` refusée"),
             "{invalid}"
         );
+    }
+
+    #[test]
+    fn an_unknown_option_is_not_a_positional_argument() {
+        assert_eq!(positional("results.tsv").unwrap(), "results.tsv");
+        assert_eq!(positional("-").unwrap(), "-");
+        let error = positional("--xx").unwrap_err().to_string();
+        assert_eq!(error, "option inconnue : --xx");
     }
 }

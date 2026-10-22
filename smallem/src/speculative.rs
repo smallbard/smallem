@@ -124,9 +124,11 @@ impl<'a, B: Backend> Follower<'a, B> {
             .forward_cached_with_hidden(tape, &mut self.cache, &[(self.id, tokens)])
     }
 
-    /// Oublie tout ce qui suit les `keep` premiers tokens lus.
-    fn keep(&mut self, keep: usize) {
-        self.cache.truncate(self.id, keep);
+    /// Oublie tout ce qui suit les `keep` premiers tokens lus. Avec une
+    /// mémoire de n-grammes, le cache doit avoir été réglé pour revenir
+    /// d'autant ([`KvCache::set_rollback`]).
+    fn keep(&mut self, backend: &B, keep: usize) {
+        self.cache.truncate(backend, self.id, keep);
         self.seen.truncate(keep);
     }
 }
@@ -218,6 +220,9 @@ impl<'a, B: Backend> DraftDecoder<'a, B> {
     /// nouveaux tokens, de 1 à `k + 1`.
     pub fn step(&mut self, sampling: &Sampling, rng: &mut impl Rng) -> Vec<u32> {
         let start = self.tokens.len();
+        // Les deux caches reviendront sur au plus `k` propositions.
+        self.target.cache.set_rollback(self.k);
+        self.draft.cache.set_rollback(self.k);
         // Le proposeur lit ce qui lui manque, puis propose un token à la
         // fois, chacun d'après les précédents.
         let mut proposed = Vec::with_capacity(self.k);
@@ -251,8 +256,9 @@ impl<'a, B: Backend> DraftDecoder<'a, B> {
         // Les caches oublient les propositions refusées. Le dernier token,
         // tiré par la vérification, n'a encore été lu par personne.
         let kept = start + verdict.accepted;
-        self.target.keep(kept);
-        self.draft.keep(self.draft.seen.len().min(kept));
+        self.target.keep(self.backend, kept);
+        let draft_kept = self.draft.seen.len().min(kept);
+        self.draft.keep(self.backend, draft_kept);
         self.tokens[start..].to_vec()
     }
 }
@@ -284,9 +290,12 @@ impl<'a, B: Backend> MultiTokenDecoder<'a, B> {
         assert!(!prompt.is_empty(), "la génération a besoin d'une amorce");
         let mut module_cache = model.multi_token_cache();
         let module_id = module_cache.add_sequence();
+        let mut target = Follower::new(model);
+        // Chaque passe revient au plus sur la proposition qu'elle vérifie.
+        target.cache.set_rollback(1);
         Self {
             backend,
-            target: Follower::new(model),
+            target,
             module_cache,
             module_id,
             module_seen: 0,
@@ -332,7 +341,7 @@ impl<'a, B: Backend> MultiTokenDecoder<'a, B> {
             self.tokens.push(*token);
         }
         self.tokens.push(next);
-        self.target.keep(start + accepted);
+        self.target.keep(self.backend, start + accepted);
 
         // Le module passe sur chaque position dont le token suivant est
         // maintenant connu, et dont l'état caché sort de cette passe.
@@ -471,7 +480,7 @@ mod tests {
         use crate::generation::generate;
         use crate::model::GptConfig;
         use crate::model::tests::{TINY, randomize};
-        use crate::nn::{Architecture, MultiToken};
+        use crate::nn::{Architecture, MemoryDims, MemoryStorage, MultiToken};
         use rand::SeedableRng;
         use rand::rngs::StdRng;
 
@@ -509,6 +518,52 @@ mod tests {
                 }
                 assert_eq!(&decoder.tokens()[..alone.len()], &alone[..], "k = {k}");
             }
+        }
+
+        /// Une mémoire de n-grammes, avec sa convolution : ce qu'elle garde
+        /// des dernières positions doit reculer avec le cache.
+        fn with_memory(architecture: Architecture) -> Architecture {
+            architecture.with_memory(MemoryDims {
+                heads: 2,
+                storage: MemoryStorage::Sparse,
+                table_std: 0.5,
+                ..MemoryDims::engram(TINY.embed, 31)
+            })
+        }
+
+        #[test]
+        fn greedy_speculation_with_a_memory_writes_the_same_tokens() {
+            let backend = Cpu::new();
+            let target = model(&backend, 1, with_memory(Architecture::MODERN));
+            let draft = model(&backend, 2, with_memory(Architecture::MODERN));
+            let mut rng = StdRng::seed_from_u64(0);
+            let alone = generate(&backend, &target, &[3, 7], 30, &GREEDY, &mut rng);
+            for k in [1, 3] {
+                let mut decoder = DraftDecoder::new(&backend, &target, &draft, &[3, 7], k);
+                while decoder.tokens().len() < alone.len() {
+                    decoder.step(&GREEDY, &mut rng);
+                }
+                assert_eq!(&decoder.tokens()[..alone.len()], &alone[..], "k = {k}");
+                let statistics = decoder.statistics;
+                assert!(
+                    statistics.accepted < statistics.proposed,
+                    "un refus au moins"
+                );
+            }
+            let architecture =
+                with_memory(Architecture::MODERN.with_multi_token(MultiToken::DEEPSEEK));
+            let target = model(&backend, 3, architecture);
+            let alone = generate(&backend, &target, &[3, 7, 1], 30, &GREEDY, &mut rng);
+            let mut decoder = MultiTokenDecoder::new(&backend, &target, &[3, 7, 1]);
+            while decoder.tokens().len() < alone.len() {
+                decoder.step(&GREEDY, &mut rng);
+            }
+            assert_eq!(&decoder.tokens()[..alone.len()], &alone[..]);
+            let statistics = decoder.statistics;
+            assert!(
+                statistics.accepted < statistics.proposed,
+                "un refus au moins"
+            );
         }
 
         #[test]

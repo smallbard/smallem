@@ -2,7 +2,7 @@
 
 use rand::Rng;
 
-use super::{AttentionKind, LatentAttention, Linear, Rope, module};
+use super::{AttentionKind, BlockShape, LatentAttention, Linear, Rope, module};
 use crate::autograd::{Tape, Var};
 use crate::backend::{Backend, Float};
 use crate::cache::{AttentionCache, CacheStep};
@@ -51,8 +51,15 @@ impl<B: Backend> CausalSelfAttention<B> {
     /// l'entrée, que le modèle connaît l'ordre des tokens. Les valeurs ne
     /// sont pas tournées.
     pub fn forward(&self, tape: &Tape<B>, x: Var, rope: Option<Rope>) -> Var {
+        self.forward_lending(tape, x, rope).0
+    }
+
+    /// Comme [`CausalSelfAttention::forward`], et rend aussi les clés et
+    /// les valeurs calculées, pour les couches qui les empruntent.
+    pub fn forward_lending(&self, tape: &Tape<B>, x: Var, rope: Option<Rope>) -> (Var, Lent) {
         let lent = self.keys_and_values(tape, x, rope);
-        attend(tape, self.heads, &self.query, &self.proj, x, rope, lent)
+        let out = attend(tape, self.heads, &self.query, &self.proj, x, rope, lent);
+        (out, lent)
     }
 
     /// Les clés et les valeurs de toutes les positions, chacune
@@ -242,16 +249,9 @@ pub enum Attention<B: Backend> {
 impl<B: Backend> Attention<B> {
     /// Avec `borrows`, la couche n'a pas de clés ni de valeurs à elle :
     /// elle prend celles de la dernière couche qui en a calculé.
-    pub fn new(
-        backend: &B,
-        kind: AttentionKind,
-        borrows: bool,
-        dim: usize,
-        heads: usize,
-        proj_std: f64,
-        rng: &mut impl Rng,
-    ) -> Self {
-        match kind {
+    pub fn new(backend: &B, shape: &BlockShape, borrows: bool, rng: &mut impl Rng) -> Self {
+        let (dim, heads, proj_std) = (shape.dim, shape.heads, shape.proj_std());
+        match shape.architecture.attention {
             AttentionKind::Standard if borrows => {
                 Self::Borrowed(BorrowedAttention::new(backend, dim, heads, proj_std, rng))
             }
@@ -280,17 +280,9 @@ impl<B: Backend> Attention<B> {
     ) -> Var {
         match (self, cache) {
             (Self::Standard(attention), None) => {
-                let own = attention.keys_and_values(tape, x, rope);
+                let (out, own) = attention.forward_lending(tape, x, rope);
                 *lent = Some(own);
-                attend(
-                    tape,
-                    attention.heads,
-                    &attention.query,
-                    &attention.proj,
-                    x,
-                    rope,
-                    own,
-                )
+                out
             }
             (Self::Standard(attention), Some((cache, step))) => {
                 let (out, own) = attention.forward_cached(tape, x, cache, step);
@@ -320,15 +312,6 @@ impl<B: Backend> Attention<B> {
             Self::Standard(a) => vec![&mut a.query, &mut a.key, &mut a.value, &mut a.proj],
             Self::Latent(a) => vec![&mut a.proj],
             Self::Borrowed(a) => vec![&mut a.query, &mut a.proj],
-        }
-    }
-
-    /// La couche qui écrit dans le flux résiduel.
-    pub fn proj(&self) -> &Linear<B> {
-        match self {
-            Self::Standard(attention) => &attention.proj,
-            Self::Latent(attention) => &attention.proj,
-            Self::Borrowed(attention) => &attention.proj,
         }
     }
 }

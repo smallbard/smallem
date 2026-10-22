@@ -58,30 +58,59 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     let args: Vec<String> = std::env::args().skip(1).collect();
     let rest = &args[1.min(args.len())..];
-    match args.first().map(String::as_str) {
-        Some("peak") => peak(),
-        Some("memory") => memory(rest),
-        Some("pool") => pool(),
-        Some("kernel") => kernel(),
-        Some("matmul") => matmul(rest),
-        Some("blocks") => blocks(rest),
-        Some("threads") => threads(),
-        Some("rows") => rows(),
-        Some("ladder") => ladder(),
-        Some("step") => step(rest)?,
-        Some("mfu") => mfu(rest)?,
-        Some("generate") => generate(rest)?,
-        Some("quantized") => quantized(rest)?,
-        Some("levels") => levels()?,
-        Some("quality") => quality(rest)?,
-        _ => {
-            return Err(
-                "mesure inconnue : peak, memory, pool, kernel, matmul, blocks, threads, step"
-                    .into(),
-            );
+    let wanted = args.first().map(String::as_str);
+    match MEASURES.iter().find(|(name, _)| Some(*name) == wanted) {
+        Some((_, measure)) => measure(rest),
+        None => {
+            let names: Vec<&str> = MEASURES.iter().map(|(name, _)| *name).collect();
+            Err(format!("mesure inconnue : {}", names.join(", ")).into())
         }
     }
-    Ok(())
+}
+
+type Measure = fn(&[String]) -> Result<(), Box<dyn Error>>;
+
+/// Les mesures, sous le nom qui les lance.
+const MEASURES: &[(&str, Measure)] = &[
+    ("peak", |_| {
+        peak();
+        Ok(())
+    }),
+    ("memory", memory),
+    ("pool", |_| {
+        pool();
+        Ok(())
+    }),
+    ("kernel", |_| {
+        kernel();
+        Ok(())
+    }),
+    ("matmul", matmul),
+    ("blocks", blocks),
+    ("threads", |_| {
+        threads();
+        Ok(())
+    }),
+    ("rows", |_| {
+        rows();
+        Ok(())
+    }),
+    ("ladder", |_| ladder()),
+    ("step", step),
+    ("mfu", mfu),
+    ("generate", generate),
+    ("quantized", quantized),
+    ("levels", |_| levels()),
+    ("quality", quality),
+];
+
+/// Les mesures écrites pour AVX-512 refusent de tourner sans lui.
+fn require_avx512(measure: &str) -> Result<(), Box<dyn Error>> {
+    if Isa::Avx512.available() {
+        Ok(())
+    } else {
+        Err(format!("la mesure `{measure}` demande un processeur AVX-512").into())
+    }
 }
 
 /// Répète `work` jusqu'à `duration` au moins, et rend le temps d'un appel.
@@ -280,18 +309,42 @@ fn peak() {
     println!("fréquence d'un cœur, chaîne d'additions : {idle:.2} GHz");
     let physical = smallem::backend::fast::default_threads();
     let logical = std::thread::available_parallelism().map_or(1, |n| n.get());
-    type Variant = (&'static str, f64, fn(f32) -> f32);
+    type Variant = (&'static str, bool, f64, fn(f32) -> f32);
+    let avx512 = Isa::Avx512.available();
+    // SAFETY : chaque variante ne tourne que si le processeur a ses
+    // instructions (le booléen).
     let variants: [Variant; 4] = [
-        ("AVX2   ", fma::AVX2_FLOPS, |s| unsafe { fma::avx2(s) }),
-        ("AVX-512", fma::AVX512_FLOPS, |s| unsafe { fma::avx512(s) }),
-        ("bf16", fma::BF16_FLOPS, |s| unsafe { fma::bf16(s) }),
-        ("vnni", fma::VNNI_OPS, |s| unsafe { fma::vnni(s) }),
+        (
+            "AVX2   ",
+            Isa::Avx2.available(),
+            fma::AVX2_FLOPS,
+            |s| unsafe { fma::avx2(s) },
+        ),
+        ("AVX-512", avx512, fma::AVX512_FLOPS, |s| unsafe {
+            fma::avx512(s)
+        }),
+        (
+            "bf16",
+            gemm::bf16_available(),
+            fma::BF16_FLOPS,
+            |s| unsafe { fma::bf16(s) },
+        ),
+        (
+            "vnni",
+            avx512 && is_x86_feature_detected!("avx512vnni"),
+            fma::VNNI_OPS,
+            |s| unsafe { fma::vnni(s) },
+        ),
     ];
     println!(
         "{:<8} {:>5} {:>12} {:>14} {:>14}",
         "jeu", "fils", "Gop/s", "op/cycle/cœur", "GHz relevés"
     );
-    for (name, flops, work) in variants {
+    for (name, available, flops, work) in variants {
+        if !available {
+            println!("{name:<8} absent de ce processeur");
+            continue;
+        }
         for threads in [1, physical, logical] {
             let (gflops, sampled) = on_threads(threads, flops, work);
             let ghz = sampled.unwrap_or(idle);
@@ -374,6 +427,7 @@ fn stream(pool: &Pool, bytes: usize) -> (f64, f64, f64) {
         let shared = smallem::backend::fast::pool::SharedMut::new(&mut data);
         let seconds = best_of(3, duration, || {
             pool.run(threads, |t| {
+                // SAFETY : chaque fil prend ses propres tableaux.
                 let mine = unsafe { &mut shared.slice(t, 1)[0] };
                 for _ in 0..repeats {
                     kernel(mine);
@@ -383,6 +437,7 @@ fn stream(pool: &Pool, bytes: usize) -> (f64, f64, f64) {
         });
         (arrays * 4 * len * threads * repeats) as f64 / seconds / 1e9
     };
+    // SAFETY : `memory` a vérifié que le processeur a AVX-512.
     let read = measure(1, &|a| {
         black_box(unsafe { read_wide(&a[0]) });
     });
@@ -397,9 +452,14 @@ fn stream(pool: &Pool, bytes: usize) -> (f64, f64, f64) {
     (read, copy, triad)
 }
 
-fn memory(args: &[String]) {
+fn memory(args: &[String]) -> Result<(), Box<dyn Error>> {
+    require_avx512("memory")?;
     let counts: Vec<usize> = match args.first() {
-        Some(threads) => vec![threads.parse().expect("un nombre de fils")],
+        Some(threads) => vec![
+            threads
+                .parse()
+                .map_err(|_| format!("nombre de fils illisible : {threads}"))?,
+        ],
         None => vec![1, smallem::backend::fast::default_threads()],
     };
     for threads in counts {
@@ -419,6 +479,7 @@ fn memory(args: &[String]) {
             bytes *= 2;
         }
     }
+    Ok(())
 }
 
 fn human(bytes: usize) -> String {
@@ -577,9 +638,10 @@ fn gemm_rate(
     2.0 * (m * k * n) as f64 / seconds / 1e9
 }
 
-fn matmul(args: &[String]) {
+fn matmul(args: &[String]) -> Result<(), Box<dyn Error>> {
     let reference = args.iter().any(|arg| arg == "reference");
     if args.iter().any(|arg| arg == "mixed") {
+        require_avx512("matmul mixed")?;
         let pool = Pool::new(smallem::backend::fast::default_threads());
         println!(
             "{:<22} {:>22} {:>12} {:>12}",
@@ -609,7 +671,7 @@ fn matmul(args: &[String]) {
                 2.0 * (m * k * n) as f64 / seconds / 1e9
             );
         }
-        return;
+        return Ok(());
     }
     let pool = Pool::new(smallem::backend::fast::default_threads());
     let single = Pool::new(1);
@@ -645,22 +707,30 @@ fn matmul(args: &[String]) {
             format!("{m} × {k} × {n}")
         );
     }
+    Ok(())
 }
 
-fn blocks(args: &[String]) {
+fn blocks(args: &[String]) -> Result<(), Box<dyn Error>> {
     let pool = Pool::new(smallem::backend::fast::default_threads());
-    let isa: Isa = args.first().map_or(Isa::detect(), |name| {
-        name.parse().expect("avx512, avx2 ou scalar")
-    });
-    let list = |index: usize, default: &[usize]| -> Vec<usize> {
-        args.get(index).map_or(default.to_vec(), |text| {
+    let isa: Isa = match args.first() {
+        Some(name) => name.parse()?,
+        None => Isa::detect(),
+    };
+    if !isa.available() {
+        return Err(format!("le processeur n'a pas les instructions {isa:?}").into());
+    }
+    let list = |index: usize, default: &[usize]| -> Result<Vec<usize>, String> {
+        args.get(index).map_or(Ok(default.to_vec()), |text| {
             text.split(',')
-                .map(|v| v.parse().expect("des nombres"))
+                .map(|v| {
+                    v.parse()
+                        .map_err(|_| format!("taille de bloc illisible : {v}"))
+                })
                 .collect()
         })
     };
-    let kcs = list(1, &[128, 192, 256, 384, 512]);
-    let mcs = list(2, &[112, 196, 280, 392, 560]);
+    let kcs = list(1, &[128, 192, 256, 384, 512])?;
+    let mcs = list(2, &[112, 196, 280, 392, 560])?;
     let shapes = [
         (1024, 1024, 1024, false, false),
         (8192, 512, 1536, false, false),
@@ -696,11 +766,13 @@ fn blocks(args: &[String]) {
             }
         }
     }
+    Ok(())
 }
 
 /// Le produit `1024³`, du plus simple au plus rapide : ce que gagne chaque
 /// idée.
-fn ladder() {
+fn ladder() -> Result<(), Box<dyn Error>> {
+    require_avx512("ladder")?;
     const N: usize = 1024;
     let (a, b) = (random(N * N, 1), random(N * N, 2));
     let rate = |seconds: f64| 2.0 * (N * N * N) as f64 / seconds / 1e9;
@@ -742,6 +814,7 @@ fn ladder() {
         ikj_body::<true>(a, b, c)
     }
     let mut c = vec![0.0f32; N * N];
+    // SAFETY : AVX-512 est vérifié en tête de la mesure.
     let reordered = best_of(2, Duration::from_millis(500), || unsafe {
         ikj(&a, &b, &mut c)
     });
@@ -768,6 +841,7 @@ fn ladder() {
             );
         }
     }
+    Ok(())
 }
 
 /// La frontière entre le produit sans emballage et le produit par blocs.

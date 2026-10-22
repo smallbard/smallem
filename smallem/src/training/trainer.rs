@@ -24,13 +24,13 @@ use std::time::Instant;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 
-use super::step::{clip_scale, evaluate, train_step_observed};
+use super::step::{clip_scale, evaluate, train_step_accumulated};
 use crate::backend::{Backend, Float};
 use crate::data::Batches;
 use crate::io::{SafeTensors, load_checkpoint, save_checkpoint, save_model};
 use crate::model::Gpt;
-use crate::nn::MemoryStorage;
-use crate::optim::{AnyOptimizer, Optimizer, OptimizerKind, cosine_schedule};
+use crate::nn::{MEMORY_STEPS, MemoryStorage, Parameter};
+use crate::optim::{AnyOptimizer, Optimizer, OptimizerKind, OptimizerState, cosine_schedule};
 
 /// Graine des lots de validation. Elle ne dépend pas de la graine de
 /// l'entraînement : deux entraînements, même de graines différentes, sont
@@ -301,6 +301,58 @@ impl<B: Backend, D: Batches> Trainer<'_, B, D> {
         resume: bool,
         mut journal: impl FnMut(Event<'_>),
     ) -> Result<Summary, Box<dyn Error>> {
+        self.check(model, resume)?;
+        let settings = &self.settings;
+        let mut optimizer = AnyOptimizer::new(
+            settings.optimizer,
+            settings.learning_rate,
+            settings.weight_decay,
+        );
+        let (first_step, mut best) = if resume {
+            let (step, best, unverified) = self.resume(model, &mut optimizer)?;
+            journal(Event::Resumed {
+                step,
+                best_val_loss: best,
+                unverified: &unverified,
+            });
+            (step, best)
+        } else {
+            journal(Event::Started {
+                val_loss: self.validation_loss(model, settings.eval_batches)?,
+            });
+            (0, f64::INFINITY)
+        };
+
+        let mut window = Window::new();
+        for step in first_step..settings.steps {
+            let learning_rate = settings.learning_rate_at(step);
+            let (loss, grad_norm) = self.step(model, &mut optimizer, step, learning_rate)?;
+            let done = step + 1;
+            if !loss.is_finite() || !grad_norm.is_finite() {
+                // Le pas n'a pas été appliqué. Continuer ne servirait à
+                // rien, et écrire un point de reprise écraserait le dernier
+                // qui vaut quelque chose.
+                return Err(self.stopped(format!(
+                    "pas {done} : perte {loss}, norme du gradient {grad_norm}"
+                )));
+            }
+            window.add(loss, grad_norm);
+            if done % settings.eval_every == 0 || done == settings.steps {
+                let evaluation =
+                    self.evaluate(model, &optimizer, done, learning_rate, &mut best, &window)?;
+                journal(Event::Evaluated(evaluation));
+                window = Window::new();
+            }
+        }
+        Ok(Summary {
+            best_val_loss: best,
+            final_val_loss: self.validation_loss(model, settings.final_eval_batches)?,
+        })
+    }
+
+    /// Refuse les réglages qui diviseraient par zéro ou ne feraient rien, et
+    /// une reprise qui ne retrouverait pas tout.
+    fn check(&self, model: &Gpt<B>, resume: bool) -> Result<(), Box<dyn Error>> {
         let settings = &self.settings;
         for (name, value) in [
             ("steps", settings.steps),
@@ -314,161 +366,266 @@ impl<B: Backend, D: Batches> Trainer<'_, B, D> {
                 return Err(format!("`{name}` doit valoir au moins 1").into());
             }
         }
+        if resume
+            && let Some(memory) = model.memory()
+            && memory.dims().storage == MemoryStorage::Host
+        {
+            return Err("une table en mémoire centrale ne reprend pas : \
+                        elle n'est pas enregistrée avec le modèle"
+                .into());
+        }
+        Ok(())
+    }
+
+    /// Relit le point de reprise dans le modèle et l'optimiseur. Rend le pas
+    /// où l'entraînement s'était arrêté, la meilleure perte de validation,
+    /// et les réglages que le point de reprise ne permet pas de vérifier.
+    fn resume(
+        &self,
+        model: &mut Gpt<B>,
+        optimizer: &mut AnyOptimizer<B>,
+    ) -> Result<(usize, f64, Vec<String>), Box<dyn Error>> {
+        let file = SafeTensors::read(self.checkpoint_path())?;
+        // Les réglages d'abord : un point de reprise qui n'est pas le bon
+        // ne doit rien changer au modèle.
+        let unverified = check_resume(&file.metadata, &self.resume_settings())?;
+        let field = |key: &str| file.metadata.get(key).ok_or(format!("`{key}` absent"));
+        let step: usize = field("step")?.parse()?;
+        let best: f64 = field("best_val_loss")?.parse()?;
+        if step >= self.settings.steps {
+            return Err(format!(
+                "cet entraînement est déjà terminé : pas {step} sur {}",
+                self.settings.steps
+            )
+            .into());
+        }
+        let mut restored = Restored {
+            optimizer,
+            memory_slots: model.memory_optimizer_slots(),
+            memory: OptimizerState::default(),
+        };
+        load_checkpoint(&file, self.backend, model, &mut restored)?;
+        let mut memory = restored.memory;
+        // Un point de reprise plus ancien que l'enregistrement de la mémoire
+        // n'a pas son compteur : elle repart de zéro.
+        if let Some(steps) = file.metadata.get(MEMORY_STEPS) {
+            memory
+                .counters
+                .insert(MEMORY_STEPS.to_string(), steps.clone());
+        }
+        model.restore_memory_optimizer_state(memory)?;
+        Ok((step, best, unverified))
+    }
+
+    /// Le pas `step`, au taux `learning_rate`. Rend la perte et la norme du
+    /// gradient avant écrêtage.
+    fn step(
+        &self,
+        model: &mut Gpt<B>,
+        optimizer: &mut AnyOptimizer<B>,
+        step: usize,
+        learning_rate: f64,
+    ) -> Result<(f64, f64), Box<dyn Error>> {
+        let (settings, backend) = (&self.settings, self.backend);
+        optimizer.set_learning_rate(learning_rate);
+        let progress = step as f64 / settings.steps as f64;
+        model.set_training_progress(progress);
+        optimizer.set_progress(progress);
+
+        let mut rng = step_rng(settings.seed, step);
+        let mut batches = Vec::with_capacity(settings.accumulate);
+        for _ in 0..settings.accumulate {
+            let batch = self
+                .train
+                .batch(&mut rng, settings.batch_size, model.config().context)?;
+            batches.push(batch.examples());
+        }
+        let (loss, grad_norm) = train_step_accumulated(
+            backend,
+            model,
+            optimizer,
+            settings.max_grad_norm,
+            settings.accumulate,
+            |m, t, index| {
+                let (tokens, targets) = &batches[index];
+                m.training_loss(t, tokens, targets, settings.batch_size)
+            },
+        );
+        // Les lignes lues de la mémoire font leur pas à part, écrêtées
+        // comme le reste, et divisées par le nombre de lots comme le
+        // gradient du modèle ; leur gradient n'entre pas dans la norme.
+        if let Some(scale) = clip_scale(grad_norm, settings.max_grad_norm) {
+            let mean = 1.0 / settings.accumulate as f64;
+            model.apply_memory_gradient(backend, learning_rate, scale * mean);
+        }
+        // L'écrêtage a déjà synchronisé le GPU pour lire la norme : lire la
+        // perte en plus ne coûte presque rien.
+        let loss = backend.item(&loss).to_f64();
+        if loss.is_finite() && grad_norm.is_finite() {
+            model.rebalance_experts(backend);
+        }
+        Ok((loss, grad_norm))
+    }
+
+    /// L'évaluation après le pas `done` : la perte de validation, le
+    /// meilleur modèle s'il vient de s'améliorer, et le point de reprise.
+    fn evaluate(
+        &self,
+        model: &Gpt<B>,
+        optimizer: &AnyOptimizer<B>,
+        done: usize,
+        learning_rate: f64,
+        best: &mut f64,
+        window: &Window,
+    ) -> Result<Evaluation, Box<dyn Error>> {
         let backend = self.backend;
         let config = model.config();
-        let checkpoint = self.checkpoint_path();
-        let mut optimizer = AnyOptimizer::new(
-            settings.optimizer,
-            settings.learning_rate,
-            settings.weight_decay,
-        );
-        let mut first_step = 0;
-        let mut best = f64::INFINITY;
-
-        if let Some(memory) = model.memory()
-            && memory.dims().storage != MemoryStorage::Dense
-        {
-            if resume {
-                return Err(
-                    "une mémoire creuse ne reprend pas : ses moments ne sont pas \
-                            enregistrés"
-                        .into(),
-                );
-            }
-            if settings.accumulate > 1 {
-                return Err(
-                    "une mémoire creuse ne cumule pas les gradients de plusieurs lots".into(),
-                );
-            }
+        let seconds = window.start.elapsed().as_secs_f64();
+        let expert_load = model.take_expert_load();
+        let val_loss = self.validation_loss(model, self.settings.eval_batches)?;
+        if !val_loss.is_finite() {
+            return Err(self.stopped(format!("pas {done} : perte de validation {val_loss}")));
         }
-        if resume {
-            let file = SafeTensors::read(&checkpoint)?;
-            // Les réglages d'abord : un point de reprise qui n'est pas le
-            // bon ne doit rien changer au modèle.
-            let unverified = check_resume(&file.metadata, &self.resume_settings())?;
-            let field = |key: &str| file.metadata.get(key).ok_or(format!("`{key}` absent"));
-            first_step = field("step")?.parse()?;
-            best = field("best_val_loss")?.parse()?;
-            if first_step >= settings.steps {
-                return Err(format!(
-                    "cet entraînement est déjà terminé : pas {first_step} sur {}",
-                    settings.steps
-                )
-                .into());
-            }
-            load_checkpoint(&file, backend, model, &mut optimizer)?;
-            journal(Event::Resumed {
-                step: first_step,
-                best_val_loss: best,
-                unverified: &unverified,
-            });
-        } else {
-            journal(Event::Started {
-                val_loss: self.validation_loss(model, settings.eval_batches)?,
-            });
+        let improved = val_loss < *best;
+        if improved {
+            *best = val_loss;
+            save_model(&self.model_path, backend, model, config.to_metadata())?;
         }
-
-        let stopped = |reason: String| -> Box<dyn Error> {
-            format!(
-                "{reason}. Entraînement arrêté ; le point de reprise {} n'a pas été modifié",
-                checkpoint.display(),
-            )
-            .into()
-        };
-        let mut train_loss_sum = 0.0;
-        let mut grad_norm_max: f64 = 0.0;
-        let mut steps_since_eval = 0;
-        let mut last_eval = Instant::now();
-
-        for step in first_step..settings.steps {
-            let learning_rate = settings.learning_rate_at(step);
-            optimizer.set_learning_rate(learning_rate);
-            let progress = step as f64 / settings.steps as f64;
-            model.set_training_progress(progress);
-            optimizer.set_progress(progress);
-
-            let mut rng = step_rng(settings.seed, step);
-            let mut batches = Vec::with_capacity(settings.accumulate);
-            for _ in 0..settings.accumulate {
-                let batch = self
-                    .train
-                    .batch(&mut rng, settings.batch_size, config.context)?;
-                batches.push(batch.examples());
-            }
-            let (loss, grad_norm) = train_step_observed(
-                backend,
-                model,
-                &mut optimizer,
-                settings.max_grad_norm,
-                settings.accumulate,
-                |m, t, index| {
-                    let (tokens, targets) = &batches[index];
-                    m.training_loss(t, tokens, targets, settings.batch_size)
-                },
-                |m, tape, grads| m.collect_memory_gradient(tape, grads),
-            );
-            // Les lignes lues de la mémoire font leur pas à part, écrêtées
-            // comme le reste ; leur gradient n'entre pas dans la norme.
-            if let Some(scale) = clip_scale(grad_norm, settings.max_grad_norm) {
-                model.apply_memory_gradient(backend, learning_rate, scale);
-            }
-            // L'écrêtage a déjà synchronisé le GPU pour lire la norme : lire
-            // la perte en plus ne coûte presque rien.
-            let loss = backend.item(&loss).to_f64();
-            let done = step + 1;
-            if !loss.is_finite() || !grad_norm.is_finite() {
-                // Le pas n'a pas été appliqué. Continuer ne servirait à
-                // rien, et écrire un point de reprise écraserait le dernier
-                // qui vaut quelque chose.
-                return Err(stopped(format!(
-                    "pas {done} : perte {loss}, norme du gradient {grad_norm}"
-                )));
-            }
-            model.rebalance_experts(backend);
-            train_loss_sum += loss;
-            grad_norm_max = grad_norm_max.max(grad_norm);
-            steps_since_eval += 1;
-
-            if done % settings.eval_every == 0 || done == settings.steps {
-                let seconds = last_eval.elapsed().as_secs_f64();
-                let expert_load = model.take_expert_load();
-                let val_loss = self.validation_loss(model, settings.eval_batches)?;
-                if !val_loss.is_finite() {
-                    return Err(stopped(format!(
-                        "pas {done} : perte de validation {val_loss}"
-                    )));
-                }
-                let improved = val_loss < best;
-                if improved {
-                    best = val_loss;
-                    save_model(&self.model_path, backend, model, config.to_metadata())?;
-                }
-                let mut metadata = config.to_metadata();
-                metadata.extend(self.resume_settings());
-                metadata.insert("step".into(), done.to_string());
-                metadata.insert("best_val_loss".into(), best.to_string());
-                save_checkpoint(&checkpoint, backend, model, &optimizer, metadata)?;
-                journal(Event::Evaluated(Evaluation {
-                    step: done,
-                    train_loss: train_loss_sum / steps_since_eval as f64,
-                    val_loss,
-                    learning_rate,
-                    grad_norm_max,
-                    steps: steps_since_eval,
-                    seconds,
-                    improved,
-                    expert_load,
-                }));
-                train_loss_sum = 0.0;
-                grad_norm_max = 0.0;
-                steps_since_eval = 0;
-                last_eval = Instant::now();
-            }
-        }
-        Ok(Summary {
-            best_val_loss: best,
-            final_val_loss: self.validation_loss(model, settings.final_eval_batches)?,
+        let mut metadata = config.to_metadata();
+        metadata.extend(self.resume_settings());
+        metadata.insert("step".into(), done.to_string());
+        metadata.insert("best_val_loss".into(), best.to_string());
+        let saved = Saved { optimizer, model };
+        save_checkpoint(self.checkpoint_path(), backend, model, &saved, metadata)?;
+        Ok(Evaluation {
+            step: done,
+            train_loss: window.loss_sum / window.steps as f64,
+            val_loss,
+            learning_rate,
+            grad_norm_max: window.grad_norm_max,
+            steps: window.steps,
+            seconds,
+            improved,
+            expert_load,
         })
+    }
+
+    /// L'erreur qui arrête l'entraînement, sans toucher au point de reprise.
+    fn stopped(&self, reason: String) -> Box<dyn Error> {
+        format!(
+            "{reason}. Entraînement arrêté ; le point de reprise {} n'a pas été modifié",
+            self.checkpoint_path().display(),
+        )
+        .into()
+    }
+}
+
+/// Les pas faits depuis la dernière évaluation.
+struct Window {
+    start: Instant,
+    steps: usize,
+    loss_sum: f64,
+    /// Plus grande norme de gradient, avant écrêtage.
+    grad_norm_max: f64,
+}
+
+impl Window {
+    fn new() -> Self {
+        Self {
+            start: Instant::now(),
+            steps: 0,
+            loss_sum: 0.0,
+            grad_norm_max: 0.0,
+        }
+    }
+
+    fn add(&mut self, loss: f64, grad_norm: f64) {
+        self.steps += 1;
+        self.loss_sum += loss;
+        self.grad_norm_max = self.grad_norm_max.max(grad_norm);
+    }
+}
+
+/// L'optimiseur tel qu'un point de reprise l'enregistre : son état, et
+/// celui de l'AdamW de la mémoire creuse du modèle, qui fait ses pas à part.
+/// Il ne sert qu'à [`save_checkpoint`], qui ne lui demande que son état.
+struct Saved<'a, B: Backend> {
+    optimizer: &'a AnyOptimizer<B>,
+    model: &'a Gpt<B>,
+}
+
+impl<B: Backend> Optimizer<B> for Saved<'_, B> {
+    fn apply(
+        &mut self,
+        _backend: &B,
+        _parameters: Vec<&mut Parameter<B>>,
+        _grads: &[Option<&B::Tensor>],
+        _grad_scale: f64,
+    ) {
+        unreachable!("l'état enregistré d'un optimiseur ne fait pas de pas")
+    }
+
+    fn learning_rate(&self) -> f64 {
+        self.optimizer.learning_rate()
+    }
+
+    fn set_learning_rate(&mut self, _learning_rate: f64) {
+        unreachable!("l'état enregistré d'un optimiseur ne change pas")
+    }
+
+    fn state(&self) -> OptimizerState<&B::Tensor> {
+        let mut state = self.optimizer.state();
+        state.extend(self.model.memory_optimizer_state());
+        state
+    }
+
+    fn state_layout(&self) -> (Vec<&'static str>, Vec<&'static str>) {
+        let (counters, mut slots) = self.optimizer.state_layout();
+        slots.extend(self.model.memory_optimizer_slots());
+        (counters, slots)
+    }
+}
+
+/// L'optimiseur tel qu'un point de reprise le relit : l'état de
+/// l'optimiseur lui revient, celui de la mémoire est mis de côté pour le
+/// modèle. Il ne sert qu'à [`load_checkpoint`].
+struct Restored<'a, B: Backend> {
+    optimizer: &'a mut AnyOptimizer<B>,
+    memory_slots: Vec<&'static str>,
+    memory: OptimizerState<B::Tensor>,
+}
+
+impl<B: Backend> Optimizer<B> for Restored<'_, B> {
+    fn apply(
+        &mut self,
+        _backend: &B,
+        _parameters: Vec<&mut Parameter<B>>,
+        _grads: &[Option<&B::Tensor>],
+        _grad_scale: f64,
+    ) {
+        unreachable!("un optimiseur en cours de relecture ne fait pas de pas")
+    }
+
+    fn learning_rate(&self) -> f64 {
+        self.optimizer.learning_rate()
+    }
+
+    fn set_learning_rate(&mut self, learning_rate: f64) {
+        self.optimizer.set_learning_rate(learning_rate);
+    }
+
+    fn state_layout(&self) -> (Vec<&'static str>, Vec<&'static str>) {
+        let (counters, mut slots) = self.optimizer.state_layout();
+        slots.extend(&self.memory_slots);
+        (counters, slots)
+    }
+
+    fn restore_state(&mut self, mut state: OptimizerState<B::Tensor>) -> Result<(), String> {
+        for prefix in &self.memory_slots {
+            let slot = state.take_slot(prefix, "de la mémoire")?;
+            self.memory.slots.push((prefix.to_string(), slot));
+        }
+        self.optimizer.restore_state(state)
     }
 }
 
@@ -479,7 +636,7 @@ mod tests {
     use crate::data::Dataset;
     use crate::io::load_parameters;
     use crate::model::GptConfig;
-    use crate::nn::{Architecture, Module};
+    use crate::nn::{Architecture, MemoryDims, Module};
     use std::fs;
 
     type B = Cpu<f32>;
@@ -767,6 +924,46 @@ mod tests {
         let mut restarted = build(5);
         resumed.run(&mut restarted, true, |_| {}).unwrap();
         assert_eq!(values(&restarted), values(&straight));
+    }
+
+    /// La table creuse d'une mémoire fait ses pas à part, avec son propre
+    /// AdamW : ses moments voyagent dans le point de reprise. Les lots
+    /// cumulés y ajoutent leurs gradients.
+    #[test]
+    fn a_resumed_training_with_a_sparse_memory_ends_with_the_same_model() {
+        let (backend, data) = (Cpu::new(), dataset());
+        let (whole_dir, resumed_dir) = (directory("memory-whole"), directory("memory-resumed"));
+        let settings = Settings {
+            accumulate: 2,
+            ..settings()
+        };
+        let whole = trainer(&backend, &data, settings.clone(), &whole_dir);
+        let resumed = trainer(&backend, &data, settings, &resumed_dir);
+        let config = GptConfig {
+            architecture: CONFIG.architecture.with_memory(MemoryDims {
+                storage: MemoryStorage::Sparse,
+                ..MemoryDims::engram(CONFIG.embed, 31)
+            }),
+            ..CONFIG
+        };
+        let build = |seed| Gpt::new(&backend, config, &mut StdRng::seed_from_u64(seed));
+        let mut straight = build(0);
+        let start = values(&straight);
+        whole
+            .run(&mut straight, false, |event| {
+                if let Event::Evaluated(evaluation) = event
+                    && evaluation.step == 3
+                {
+                    fs::copy(whole.checkpoint_path(), resumed.checkpoint_path()).unwrap();
+                }
+            })
+            .unwrap();
+        assert_ne!(values(&straight), start, "la table apprend");
+        let mut restarted = build(5);
+        resumed.run(&mut restarted, true, |_| {}).unwrap();
+        assert_eq!(values(&restarted), values(&straight));
+        fs::remove_dir_all(whole_dir).unwrap();
+        fs::remove_dir_all(resumed_dir).unwrap();
     }
 
     /// Chaque variante de Muon a son état : pas périodiques comptés,

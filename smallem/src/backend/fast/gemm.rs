@@ -27,6 +27,7 @@
 
 use std::cell::RefCell;
 
+use super::Buffer;
 use super::Isa;
 use super::kernels::{MicroKernel, Scalar};
 use super::pool::{Pool, SharedMut};
@@ -152,6 +153,7 @@ pub fn gemm_with_blocks(
     accumulate: bool,
     blocks: Blocks,
 ) {
+    isa.check();
     assert_eq!(a.cols, b.rows, "gemm : formes incompatibles");
     assert_eq!(
         c.len(),
@@ -176,6 +178,7 @@ pub fn gemm_with_blocks(
         few_rows(pool, isa, a, b, c, accumulate);
         return;
     }
+    // Les micro-kernels vectoriels ne sont choisis qu'après `isa.check()`.
     match isa {
         #[cfg(target_arch = "x86_64")]
         Isa::Avx512 => blocked::<super::kernels::Avx512>(pool, a, b, c, accumulate, blocks),
@@ -239,6 +242,7 @@ fn blocked<K: MicroKernel>(
                 }
                 let shared_b = SharedMut::new(&mut packed_b[..size]);
                 pool.run(panels, |panel| {
+                    // SAFETY : chaque tâche emballe son propre panneau.
                     let target = unsafe { shared_b.slice(panel * nr * depth, nr * depth) };
                     pack_b(
                         b,
@@ -397,6 +401,7 @@ fn blocked_bf16(
                 }
                 let shared_b = SharedMut::new(&mut packed_b[..size]);
                 pool.run(panels, |panel| {
+                    // SAFETY : chaque tâche emballe son propre panneau.
                     let target = unsafe { shared_b.slice(panel * NR * pairs, NR * pairs) };
                     let (col, cols) = (jc + panel * NR, NR.min(width - panel * NR));
                     target.fill(0);
@@ -450,6 +455,9 @@ fn blocked_bf16(
                             for ir in 0..panels_a {
                                 let row = ic + ir * MR;
                                 let rows = MR.min(m - row);
+                                // SAFETY : `bf16_available()` est vérifiée
+                                // par `gemm_mixed` ; chaque tâche écrit ses
+                                // propres lignes et colonnes de C.
                                 unsafe {
                                     super::kernels::bf16_14x32(
                                         pairs,
@@ -527,6 +535,44 @@ fn pack_b(b: Matrix, pc: usize, depth: usize, col: usize, cols: usize, nr: usize
     }
 }
 
+// --- Les tranches de la dimension commune ---
+
+/// Un produit `C = A · B` découpé en `slices` tranches de la dimension
+/// commune, de `tasks` tâches chacune : `work(tranche, tâche, cible)`
+/// calcule sa part dans `cible`, une vue de `m × n` éléments, comme `C`. La
+/// première tranche écrit dans `C`, chacune des suivantes dans sa somme
+/// partielle, qu'elle doit écrire en entier ; les sommes partielles
+/// s'ajoutent ensuite à `C` dans l'ordre des tranches. Le résultat ne
+/// dépend donc que du découpage, pas des fils.
+pub(crate) fn split_k(
+    pool: &Pool,
+    c: &mut [f32],
+    slices: usize,
+    tasks: usize,
+    work: impl Fn(usize, usize, SharedMut<'_, f32>) + Sync,
+) {
+    let size = c.len();
+    let mut partial = Buffer::any(slices.saturating_sub(1) * size);
+    {
+        let first = SharedMut::new(c);
+        let rest = SharedMut::new(&mut partial);
+        pool.run(slices * tasks, |index| {
+            let (slice, task) = (index / tasks, index % tasks);
+            let target = if slice == 0 {
+                first
+            } else {
+                rest.view((slice - 1) * size, size)
+            };
+            work(slice, task, target);
+        });
+    }
+    for part in partial.chunks(size.max(1)) {
+        for (value, &x) in c.iter_mut().zip(part) {
+            *value += x;
+        }
+    }
+}
+
 // --- Quelques lignes ---
 
 /// Des colonnes par groupes de cette taille : la tâche d'un fil. Une ligne
@@ -568,15 +614,7 @@ fn few_rows(pool: &Pool, isa: Isa, a: Matrix, b: Matrix, c: &mut [f32], accumula
             .max(1);
         let depth = k.div_ceil(slices);
         let slices = k.div_ceil(depth);
-        let mut partial = if slices > 1 {
-            vec![0.0f32; (slices - 1) * m * n]
-        } else {
-            Vec::new()
-        };
-        let out = SharedMut::new(c);
-        let rest = SharedMut::new(&mut partial);
-        pool.run(groups * slices, |task| {
-            let (slice, group) = (task / groups, task % groups);
+        split_k(pool, c, slices, groups, |slice, group, target| {
             let first = group * width;
             let end = n.min(first + width);
             let (begin, stop) = (slice * depth, k.min((slice + 1) * depth));
@@ -590,15 +628,8 @@ fn few_rows(pool: &Pool, isa: Isa, a: Matrix, b: Matrix, c: &mut [f32], accumula
                 rows: stop - begin,
                 ..b
             };
-            // La première tranche écrit dans C, les autres à part.
-            let (target, accumulate) = if slice == 0 {
-                (out, accumulate)
-            } else {
-                (
-                    unsafe { SharedMut::from_ptr(rest.ptr((slice - 1) * m * n)) },
-                    false,
-                )
-            };
+            // Seule la première tranche ajoute à ce que contient C.
+            let accumulate = accumulate && slice == 0;
             if width == FEW_ROWS_COLUMNS {
                 let block = Block {
                     a,
@@ -627,11 +658,6 @@ fn few_rows(pool: &Pool, isa: Isa, a: Matrix, b: Matrix, c: &mut [f32], accumula
                 direct::<FEW_ROWS_BLOCK>(isa, block, m - row);
             }
         });
-        for part in partial.chunks(m * n) {
-            for (value, &x) in c.iter_mut().zip(part) {
-                *value += x;
-            }
-        }
     } else if b.row_stride == 1 {
         // `B` est une transposée : chaque élément est le produit scalaire de
         // deux lignes contiguës.
@@ -641,6 +667,7 @@ fn few_rows(pool: &Pool, isa: Isa, a: Matrix, b: Matrix, c: &mut [f32], accumula
             let start = group * FEW_ROWS_DOTS;
             let width = FEW_ROWS_DOTS.min(n - start);
             for i in 0..m {
+                // SAFETY : chaque tâche écrit son groupe de colonnes.
                 let target = unsafe { out.slice(i * n + start, width) };
                 for (offset, value) in target.iter_mut().enumerate() {
                     let column = &b.data[(start + offset) * b.col_stride..][..b.rows];
@@ -663,7 +690,7 @@ struct Block<'a> {
     b: Matrix<'a>,
     start: usize,
     width: usize,
-    out: SharedMut<f32>,
+    out: SharedMut<'a, f32>,
     n: usize,
     accumulate: bool,
 }
@@ -722,6 +749,8 @@ fn direct<const W: usize>(isa: Isa, block: Block, rows: usize) {
     }
 
     fn with<const R: usize, const W: usize>(isa: Isa, block: Block) {
+        // SAFETY : `isa` a été vérifiée par `gemm_with_blocks`, seule
+        // appelante de `few_rows` ; chaque tâche écrit son propre bloc.
         match isa {
             #[cfg(target_arch = "x86_64")]
             Isa::Avx512 if W == 64 => unsafe { x86::direct_avx512::<R, 4>(block) },
@@ -786,6 +815,8 @@ mod x86 {
             line = line.wrapping_add(b.row_stride);
         }
         for (r, sums) in acc.iter().enumerate() {
+            // SAFETY : les colonnes masquées ne sont pas écrites ; chaque
+            // tâche écrit ses propres colonnes.
             unsafe {
                 let target = out.ptr((row + r) * n + start);
                 for (v, &mask) in masks.iter().enumerate() {

@@ -36,22 +36,25 @@ use std::thread;
 use rand::rngs::StdRng;
 use rand::{Rng, RngExt, SeedableRng};
 
-use super::{Module, Parameter, Projection, RmsNorm, child_name};
+use super::architecture::named_choices;
+use super::{Module, Parameter, Projection, RmsNorm, child_name, sigmoid};
 use crate::autograd::{Gradients, Tape, Var};
 use crate::backend::{AdamWStep, Backend, Float, standard_normal};
 use crate::cache::{KvCache, SequenceId};
 use crate::ngram::NgramHash;
+use crate::optim::{AdamWSettings, OptimizerState};
 
 /// La graine des multiplicateurs du hachage. Elle est fixe : un modèle
 /// enregistré relit sa table avec le même hachage.
 pub const HASH_SEED: u64 = 1234;
 
-/// Où vit la table, et comment elle apprend.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MemoryStorage {
-    Dense,
-    Sparse,
-    Host,
+named_choices! {
+    /// Où vit la table, et comment elle apprend.
+    MemoryStorage {
+        Dense => "dense",
+        Sparse => "sparse",
+        Host => "host",
+    }
 }
 
 /// La forme d'une mémoire de n-grammes.
@@ -187,10 +190,11 @@ pub struct Memory<B: Backend> {
     pub conv_norm: Option<RmsNorm<B>>,
     pub conv: Option<Parameter<B>>,
     lookup: RefCell<Option<Lookup>>,
-    /// Le gradient des lignes lues au dernier pas, avec ces lignes.
-    gradient: Option<(Vec<Vec<u32>>, B::Tensor)>,
+    /// Le gradient des lignes lues depuis le dernier pas, avec ces lignes :
+    /// un par lot quand un pas en cumule plusieurs.
+    gradients: Vec<(Vec<Vec<u32>>, B::Tensor)>,
     /// Pas d'AdamW déjà faits sur la table.
-    steps: usize,
+    steps: u32,
     /// Faux pour « couper » la mémoire : le module ne s'ajoute plus au flux.
     enabled: Cell<bool>,
 }
@@ -242,7 +246,7 @@ impl<B: Backend> Memory<B> {
                 .conv
                 .then(|| Parameter::zeros(backend, &[KERNEL, width])),
             lookup: RefCell::new(None),
-            gradient: None,
+            gradients: Vec::new(),
             steps: 0,
             enabled: Cell::new(true),
         }
@@ -348,10 +352,7 @@ impl<B: Backend> Memory<B> {
                         source.push(at.map(|at| (base + at) as u32));
                     }
                 }
-                let last: Vec<u32> = (total.saturating_sub(keep)..total)
-                    .map(|r| r as u32)
-                    .collect();
-                cache.set_memory_rows(id, backend.gather_rows(&combined, &last));
+                cache.set_memory_rows(backend, id, combined.clone(), keep);
                 all = Some(match all {
                     Some(all) => backend.concat_rows(&all, &combined),
                     None => combined,
@@ -474,40 +475,42 @@ impl<B: Backend> Memory<B> {
 
     /// Garde le gradient des lignes lues par la passe de la tape `tape`,
     /// pour [`Memory::apply`]. Sans effet pour une table dense : son
-    /// gradient va à l'optimiseur du modèle.
+    /// gradient va à l'optimiseur du modèle. Les gradients de plusieurs lots
+    /// s'additionnent jusqu'au pas suivant.
     pub fn collect(&mut self, tape: u64, grads: &Gradients<B>) {
         let lookup = self.lookup.get_mut().take();
         let Some(lookup) = lookup.filter(|lookup| lookup.tape == tape) else {
             return;
         };
         if let Some(grad) = grads.get(lookup.rows) {
-            assert!(
-                self.gradient.is_none(),
-                "la mémoire creuse ne cumule pas les gradients de plusieurs lots"
-            );
-            self.gradient = Some((lookup.unique, grad.clone()));
+            self.gradients.push((lookup.unique, grad.clone()));
         }
     }
 
-    /// Le pas d'AdamW des lignes lues, au taux `learning_rate × lr_scale`,
-    /// sans décroissance des poids. Les moments des lignes non lues ne
-    /// bougent pas, et la correction de biais suit le nombre de pas de la
-    /// table, comme le `SparseAdam` de PyTorch.
+    /// Le pas d'AdamW des lignes lues depuis le dernier pas, au taux
+    /// `learning_rate × lr_scale`, sans décroissance des poids. Le gradient
+    /// est la somme de ceux des lots lus, multipliée par `grad_scale`. Les
+    /// moments des lignes non lues ne bougent pas, et la correction de biais
+    /// suit le nombre de pas de la table, comme le `SparseAdam` de PyTorch.
     pub fn apply(&mut self, backend: &B, learning_rate: f64, grad_scale: f64) {
-        let Some((unique, grad)) = self.gradient.take() else {
-            return;
+        let gradients = std::mem::take(&mut self.gradients);
+        let (unique, grad) = match gradients.len() {
+            0 => return,
+            1 => gradients.into_iter().next().expect("un gradient"),
+            _ => {
+                let spares: Vec<u32> = (0..self.hash.tables())
+                    .map(|t| self.hash.rows(t) as u32)
+                    .collect();
+                merge_gradients(backend, gradients, &spares)
+            }
         };
         self.steps += 1;
-        let step = AdamWStep {
-            learning_rate: learning_rate * self.dims.lr_scale,
-            beta1: BETA1,
-            beta2: BETA2,
-            epsilon: EPSILON,
-            weight_decay: 0.0,
-            bias_correction1: 1.0 - BETA1.powi(self.steps as i32),
-            bias_correction2: 1.0 - BETA2.powi(self.steps as i32),
+        let step = AdamWSettings::NANOGPT.step(
+            self.steps,
+            learning_rate * self.dims.lr_scale,
+            0.0,
             grad_scale,
-        };
+        );
         match &mut self.table {
             MemoryTable::Dense(_) => unreachable!("une table dense n'a pas de gradient à part"),
             MemoryTable::Sparse(sparse) => {
@@ -541,6 +544,139 @@ impl<B: Backend> Memory<B> {
             MemoryTable::Host(host) => host.adamw(backend, &unique, &grad, &step),
         }
     }
+
+    /// L'état de l'AdamW d'une table creuse, rangé comme celui d'un
+    /// optimiseur ([`OptimizerState`]) : un tenseur par paramètre de la
+    /// mémoire, dans l'ordre de [`Module::walk`], `None` hors des tables.
+    /// Vide pour une table dense, dont l'optimiseur du modèle tient l'état,
+    /// et pour une table en mémoire centrale, qui ne s'enregistre pas.
+    pub fn optimizer_state(&self) -> OptimizerState<&B::Tensor> {
+        let MemoryTable::Sparse(sparse) = &self.table else {
+            return OptimizerState::default();
+        };
+        let others = self.parameters().len() - sparse.values.len();
+        let slot = |pick: fn(&Moments<B>) -> &B::Tensor| -> Vec<Option<&B::Tensor>> {
+            sparse
+                .moments
+                .iter()
+                .map(|moments| moments.as_ref().map(pick))
+                .chain(std::iter::repeat_n(None, others))
+                .collect()
+        };
+        OptimizerState {
+            counters: [(MEMORY_STEPS.to_string(), self.steps.to_string())].into(),
+            slots: vec![
+                (MEMORY_FIRST_MOMENT.to_string(), slot(|m| &m.0)),
+                (MEMORY_SECOND_MOMENT.to_string(), slot(|m| &m.1)),
+            ],
+        }
+    }
+
+    /// Les préfixes des séries de [`Memory::optimizer_state`].
+    pub fn optimizer_slots(&self) -> Vec<&'static str> {
+        match self.table {
+            MemoryTable::Sparse(_) => vec![MEMORY_FIRST_MOMENT, MEMORY_SECOND_MOMENT],
+            _ => Vec::new(),
+        }
+    }
+
+    /// Remet l'AdamW d'une table creuse dans un état enregistré. Un
+    /// compteur absent, celui d'un point de reprise écrit avant que la
+    /// mémoire ne s'y range, fait repartir la table de zéro, comme les
+    /// moments absents.
+    pub fn restore_optimizer_state(
+        &mut self,
+        mut state: OptimizerState<B::Tensor>,
+    ) -> Result<(), String> {
+        let count = self.parameters().len();
+        let MemoryTable::Sparse(sparse) = &mut self.table else {
+            return Ok(());
+        };
+        self.steps = match state.counters.get(MEMORY_STEPS) {
+            Some(steps) => steps
+                .parse()
+                .map_err(|_| format!("état de la mémoire : `{MEMORY_STEPS}` illisible"))?,
+            None => 0,
+        };
+        let first = state.take_slot(MEMORY_FIRST_MOMENT, "de la mémoire")?;
+        let second = state.take_slot(MEMORY_SECOND_MOMENT, "de la mémoire")?;
+        if first.len() != count || second.len() != count {
+            return Err("état de la mémoire : un moment par paramètre est attendu".into());
+        }
+        sparse.moments = first
+            .into_iter()
+            .zip(second)
+            .take(sparse.values.len())
+            .map(|pair| match pair {
+                (Some(first), Some(second)) => Ok(Some((first, second))),
+                (None, None) => Ok(None),
+                _ => Err("état de la mémoire : un moment sans l'autre".to_string()),
+            })
+            .collect::<Result<_, _>>()?;
+        Ok(())
+    }
+}
+
+/// Les moments d'AdamW d'une table creuse.
+type Moments<B> = (
+    <B as crate::backend::Primitives>::Tensor,
+    <B as crate::backend::Primitives>::Tensor,
+);
+
+/// Nom du compteur de pas de la table creuse dans un point de reprise, et
+/// préfixes de ses deux séries de moments.
+pub const MEMORY_STEPS: &str = "memory.adamw.steps";
+const MEMORY_FIRST_MOMENT: &str = "memory.adamw.m.";
+const MEMORY_SECOND_MOMENT: &str = "memory.adamw.v.";
+
+/// Réunit les gradients de plusieurs lots : pour chaque table, l'union des
+/// lignes lues, triée et complétée par la ligne de réserve jusqu'au total
+/// des lignes des lots (une taille qui ne dépend pas des tokens, comme dans
+/// [`compact`]), et la somme des gradients sur ces lignes.
+fn merge_gradients<B: Backend>(
+    backend: &B,
+    gradients: Vec<(Vec<Vec<u32>>, B::Tensor)>,
+    spares: &[u32],
+) -> (Vec<Vec<u32>>, B::Tensor) {
+    let union: Vec<Vec<u32>> = (0..spares.len())
+        .map(|t| {
+            let total: usize = gradients.iter().map(|(unique, _)| unique[t].len()).sum();
+            let mut lines: Vec<u32> = gradients
+                .iter()
+                .flat_map(|(unique, _)| unique[t].iter().copied())
+                .collect();
+            lines.sort_unstable();
+            lines.dedup();
+            lines.resize(total, spares[t]);
+            lines
+        })
+        .collect();
+    let mut starts = Vec::with_capacity(union.len());
+    let mut rows = 0;
+    for lines in &union {
+        starts.push(rows);
+        rows += lines.len();
+    }
+    let mut sum: Option<B::Tensor> = None;
+    for (unique, grad) in &gradients {
+        let at: Vec<u32> = unique
+            .iter()
+            .enumerate()
+            .flat_map(|(t, lines)| {
+                let (union, start) = (&union[t], starts[t]);
+                lines.iter().map(move |line| {
+                    let place = union.binary_search(line).expect("ligne réunie");
+                    (start + place) as u32
+                })
+            })
+            .collect();
+        let spread = backend.scatter_add_rows(grad, &at, rows);
+        sum = Some(match sum {
+            Some(sum) => backend.add(&sum, &spread),
+            None => spread,
+        });
+    }
+    (union, sum.expect("au moins un gradient"))
 }
 
 impl<B: Backend> Module<B> for Memory<B> {
@@ -569,6 +705,10 @@ impl<B: Backend> Module<B> for Memory<B> {
         self.conv_norm.walk_mut(&name("conv_norm"), visitor);
         self.conv.walk_mut(&name("conv"), visitor);
     }
+
+    fn collect_gradients(&mut self, tape: u64, grads: &Gradients<B>) {
+        self.collect(tape, grads);
+    }
 }
 
 impl<B: Backend> Module<B> for MemoryTable<B> {
@@ -593,10 +733,6 @@ impl<B: Backend> Module<B> for MemoryTable<B> {
         }
     }
 }
-
-const BETA1: f64 = 0.9;
-const BETA2: f64 = 0.95;
-const EPSILON: f64 = 1e-8;
 
 impl HostTables {
     fn new(hash: &NgramHash, dim: usize, std: f64, seeds: &[u64]) -> Self {
@@ -771,12 +907,6 @@ fn shift<B: Backend>(tape: &Tape<B>, x: Var, positions: usize, length: usize, de
     tape.mul(tape.gather_rows(x, &source), mask)
 }
 
-/// `1 / (1 + e^(−x))`.
-fn sigmoid<B: Backend>(tape: &Tape<B>, x: Var) -> Var {
-    let one = tape.scalar(B::Scalar::ONE);
-    tape.div(one, tape.add(one, tape.exp(tape.neg(x))))
-}
-
 /// `signe(x) √|x|`, écrit `x / (x² + ε)^¼` pour rester dérivable en zéro :
 /// Engram borne de même `|x|` à 10⁻⁶ sous la racine.
 fn signed_sqrt<B: Backend>(tape: &Tape<B>, x: Var) -> Var {
@@ -904,7 +1034,7 @@ mod tests {
                     let id = tape.id();
                     drop(tape);
                     memory.collect(id, &grads);
-                    let (_, grad) = memory.gradient.as_ref().expect("gradient");
+                    let (_, grad) = memory.gradients.last().expect("gradient");
                     let norm = backend
                         .item(&backend.sum_all(&backend.mul(grad, grad)))
                         .to_f64();
@@ -929,6 +1059,70 @@ mod tests {
             losses[1].2 < losses[1].0,
             "le pas fait baisser la perte : {losses:?}"
         );
+    }
+
+    /// Les gradients de plusieurs lots se réunissent ligne par ligne, en
+    /// un tenseur dont la taille ne dépend pas des tokens.
+    #[test]
+    fn gradients_of_several_batches_add_up_line_by_line() {
+        type T = <Cpu<f64> as Primitives>::Tensor;
+        let backend = Cpu::<f64>::new();
+        let mut rng = StdRng::seed_from_u64(4);
+        let mut memory = Memory::new(&backend, dims(MemoryStorage::Sparse), 4, &mut rng);
+        for tokens in [[7u32, 8, 9], [8, 9, 3]] {
+            let indices = memory.hash.indices(&tokens, 1);
+            let tape = Tape::new(&backend);
+            let h = tape.leaf(backend.ones(&[1, 3, 4]));
+            let out = memory.forward(&tape, h, &indices, 3);
+            let grads = tape.backward(tape.sum_all(tape.mul(out, out)));
+            let id = tape.id();
+            drop(tape);
+            memory.collect(id, &grads);
+        }
+        let d = memory.dims.head_dim();
+        let add = |sums: &mut std::collections::BTreeMap<(usize, u32), Vec<f64>>,
+                   unique: &[Vec<u32>],
+                   grad: &T| {
+            let data = backend.to_vec(grad);
+            let mut row = 0;
+            for (t, lines) in unique.iter().enumerate() {
+                for &line in lines {
+                    let sum = sums.entry((t, line)).or_insert_with(|| vec![0.0; d]);
+                    for (s, g) in sum.iter_mut().zip(&data[row * d..(row + 1) * d]) {
+                        *s += g;
+                    }
+                    row += 1;
+                }
+            }
+        };
+        let mut expected = Default::default();
+        for (unique, grad) in &memory.gradients {
+            add(&mut expected, unique, grad);
+        }
+        let tables = memory.hash.tables();
+        let spares: Vec<u32> = (0..tables).map(|t| memory.hash.rows(t) as u32).collect();
+        let (union, sum) =
+            merge_gradients(&backend, std::mem::take(&mut memory.gradients), &spares);
+        assert_eq!(backend.shape(&sum), [2 * 3 * tables, d]);
+        for (lines, spare) in union.iter().zip(&spares) {
+            let read: Vec<&u32> = lines.iter().filter(|line| *line != spare).collect();
+            assert!(read.windows(2).all(|w| w[0] < w[1]), "{lines:?}");
+        }
+        let mut merged = Default::default();
+        add(&mut merged, &union, &sum);
+        // Les lignes de réserve, ajoutées pour compléter, n'ont pas de
+        // gradient.
+        for ((t, line), value) in &merged {
+            if !expected.contains_key(&(*t, *line)) {
+                assert_eq!(*line, spares[*t]);
+                assert!(value.iter().all(|&g| g == 0.0), "{value:?}");
+            }
+        }
+        for (key, value) in &expected {
+            for (a, b) in value.iter().zip(&merged[key]) {
+                assert!((a - b).abs() < 1e-12, "{key:?} : {a} et {b}");
+            }
+        }
     }
 
     #[test]

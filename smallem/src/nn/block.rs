@@ -28,44 +28,36 @@ pub struct Block<B: Backend> {
     pub feed_forward: FeedForwardLayer<B>,
 }
 
+/// Ce dont un bloc est fait : sa largeur, ses têtes, ses pièces, et le
+/// nombre de blocs du modèle, dont dépend l'initialisation.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BlockShape {
+    pub dim: usize,
+    pub heads: usize,
+    pub layers: usize,
+    pub architecture: Architecture,
+}
+
+impl BlockShape {
+    /// L'écart-type initial des projections qui écrivent dans le flux
+    /// résiduel : celui des autres poids, divisé par `√(2 × layers)`.
+    /// `2 × layers` sous-couches s'additionnent dans ce flux, et sans cela
+    /// sa variance grandirait avec la profondeur.
+    pub fn proj_std(&self) -> f64 {
+        INIT_STD / (2.0 * self.layers as f64).sqrt()
+    }
+}
+
 impl<B: Backend> Block<B> {
-    /// `layers` est le nombre total de blocs du modèle. Les projections qui
-    /// écrivent dans le flux résiduel sont initialisées avec un écart-type
-    /// divisé par `√(2 × layers)` : `2 × layers` sous-couches s'additionnent
-    /// dans ce flux, et sans cela sa variance grandirait avec la profondeur.
-    ///
     /// Avec `borrows`, l'attention du bloc emprunte ses clés et ses valeurs
     /// à un bloc précédent (voir [`Architecture::own_keys`]).
-    pub fn new(
-        backend: &B,
-        dim: usize,
-        heads: usize,
-        layers: usize,
-        architecture: Architecture,
-        borrows: bool,
-        rng: &mut impl Rng,
-    ) -> Self {
-        let proj_std = INIT_STD / (2.0 * layers as f64).sqrt();
+    pub fn new(backend: &B, shape: BlockShape, borrows: bool, rng: &mut impl Rng) -> Self {
+        let (norm, dim) = (shape.architecture.norm, shape.dim);
         Self {
-            ln1: Norm::new(backend, architecture.norm, dim),
-            attention: Attention::new(
-                backend,
-                architecture.attention,
-                borrows,
-                dim,
-                heads,
-                proj_std,
-                rng,
-            ),
-            ln2: Norm::new(backend, architecture.norm, dim),
-            feed_forward: FeedForwardLayer::new(
-                backend,
-                architecture.feed_forward,
-                architecture.experts,
-                dim,
-                proj_std,
-                rng,
-            ),
+            ln1: Norm::new(backend, norm, dim),
+            attention: Attention::new(backend, &shape, borrows, rng),
+            ln2: Norm::new(backend, norm, dim),
+            feed_forward: FeedForwardLayer::new(backend, &shape, rng),
         }
     }
 

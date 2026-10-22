@@ -18,7 +18,7 @@
 //! d'entraînement coûte donc trois passes avant.
 
 use crate::model::GptConfig;
-use crate::nn::{AttentionKind, FeedForwardKind, SwiGluFeedForward};
+use crate::nn::{AttentionKind, FeedForwardKind, swiglu_hidden};
 
 /// Les multiplications-additions d'une passe avant sur `batch` séquences
 /// de `length` tokens, ou `None` pour les pièces que ce compte ne connaît
@@ -65,12 +65,7 @@ pub fn forward_macs(config: &GptConfig, batch: usize, length: usize) -> Option<u
             };
             macs += match architecture.feed_forward {
                 FeedForwardKind::Gelu => 8 * tokens * c * c,
-                FeedForwardKind::SwiGlu => {
-                    3 * tokens
-                        * c
-                        * SwiGluFeedForward::<crate::backend::cpu::Cpu<f32>>::hidden(config.embed)
-                            as u64
-                }
+                FeedForwardKind::SwiGlu => 3 * tokens * c * swiglu_hidden(config.embed) as u64,
             };
         }
     }

@@ -187,7 +187,17 @@ fn block_keeps_the_shape_and_counts_its_parameters() {
     const C: usize = 8;
     let backend = Cpu::new();
     let mut rng = StdRng::seed_from_u64(0);
-    let block = Block::<B>::new(&backend, C, 2, 1, Architecture::GPT2, false, &mut rng);
+    let block = Block::<B>::new(
+        &backend,
+        BlockShape {
+            dim: C,
+            heads: 2,
+            layers: 1,
+            architecture: Architecture::GPT2,
+        },
+        false,
+        &mut rng,
+    );
     let tape = Tape::new(&backend);
     let x = tape.constant(CpuTensor::randn(&[2, 5, C], &mut rng));
     assert_eq!(
@@ -210,10 +220,12 @@ fn residual_projections_start_smaller() {
     let backend = Cpu::new();
     let block = Block::<B>::new(
         &backend,
-        64,
-        4,
-        8,
-        Architecture::GPT2,
+        BlockShape {
+            dim: 64,
+            heads: 4,
+            layers: 8,
+            architecture: Architecture::GPT2,
+        },
         false,
         &mut StdRng::seed_from_u64(0),
     );
@@ -225,7 +237,7 @@ fn residual_projections_start_smaller() {
         panic!("attention classique attendue");
     };
     assert!((spread(&attention.query.weight) - 0.02).abs() < 2e-3);
-    assert!((spread(&block.attention.proj().weight) - 0.005).abs() < 5e-4);
+    assert!((spread(&attention.proj.weight) - 0.005).abs() < 5e-4);
     let FeedForwardLayer::Gelu(feed_forward) = &block.feed_forward else {
         panic!("feed-forward de GPT-2 attendu");
     };
@@ -237,10 +249,12 @@ fn names_follow_the_order_of_parameters() {
     let backend = Cpu::new();
     let block = Block::<B>::new(
         &backend,
-        8,
-        2,
-        1,
-        Architecture::GPT2,
+        BlockShape {
+            dim: 8,
+            heads: 2,
+            layers: 1,
+            architecture: Architecture::GPT2,
+        },
         false,
         &mut StdRng::seed_from_u64(0),
     );
@@ -282,8 +296,8 @@ fn swiglu_maps_back_to_the_input_dimension() {
     let tape = Tape::new(&backend);
     let x = tape.constant(CpuTensor::randn(&[2, 5, 12], &mut StdRng::seed_from_u64(1)));
     assert_eq!(tape.shape(layer.forward(&tape, x)), vec![2, 5, 12]);
-    assert_eq!(SwiGluFeedForward::<B>::hidden(12), 32);
-    assert_eq!(SwiGluFeedForward::<B>::hidden(512), 1368);
+    assert_eq!(swiglu_hidden(12), 32);
+    assert_eq!(swiglu_hidden(512), 1368);
     assert_eq!(
         layer.parameter_names(),
         [
@@ -409,8 +423,28 @@ fn modules_are_walked_in_field_order_with_nested_names() {
     let backend = Cpu::new();
     let mut rng = StdRng::seed_from_u64(0);
     let mut blocks = vec![
-        Block::<B>::new(&backend, 8, 2, 2, Architecture::GPT2, false, &mut rng),
-        Block::<B>::new(&backend, 8, 2, 2, Architecture::MODERN, false, &mut rng),
+        Block::<B>::new(
+            &backend,
+            BlockShape {
+                dim: 8,
+                heads: 2,
+                layers: 2,
+                architecture: Architecture::GPT2,
+            },
+            false,
+            &mut rng,
+        ),
+        Block::<B>::new(
+            &backend,
+            BlockShape {
+                dim: 8,
+                heads: 2,
+                layers: 2,
+                architecture: Architecture::MODERN,
+            },
+            false,
+            &mut rng,
+        ),
     ];
     let names = blocks.parameter_names();
     assert_eq!(names[0], "0.ln1.gain");
@@ -735,7 +769,17 @@ fn a_block_can_use_latent_attention() {
     let backend = Cpu::new();
     let mut rng = StdRng::seed_from_u64(0);
     let architecture = Architecture::MODERN.with_attention(AttentionKind::Latent(LATENT));
-    let block = Block::<B>::new(&backend, 8, 2, 2, architecture, false, &mut rng);
+    let block = Block::<B>::new(
+        &backend,
+        BlockShape {
+            dim: 8,
+            heads: 2,
+            layers: 2,
+            architecture,
+        },
+        false,
+        &mut rng,
+    );
     let names = block.parameter_names();
     assert!(names.contains(&"attention.latent_down.weight".to_string()));
     assert!(!names.iter().any(|name| name.starts_with("attention.key.")));
@@ -1138,4 +1182,18 @@ fn expert_groups_are_padded_to_round_sizes() {
     for (s, d) in sparse.iter().zip(&run_experts(&layer, &input)) {
         assert!((s - d).abs() < 1e-12, "{s} != {d}");
     }
+}
+
+#[test]
+fn a_value_changed_in_place_gets_a_new_leaf() {
+    // Comme après `set_value`, la feuille de l'ancienne valeur ne sert plus.
+    let backend = Cpu::new();
+    let mut parameter = Parameter::<B>::zeros(&backend, &[2]);
+    let tape = Tape::new(&backend);
+    let before = parameter.var(&tape);
+    assert_eq!(parameter.var(&tape), before, "une feuille par tape");
+    *parameter.value_mut() = crate::backend::Primitives::ones(&backend, &[2]);
+    let after = parameter.var(&tape);
+    assert_ne!(after, before);
+    assert_eq!(tape.value(after).data(), [1.0, 1.0]);
 }
