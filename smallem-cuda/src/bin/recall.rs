@@ -25,10 +25,9 @@ use smallem::backend::fast::Fast;
 use smallem::backend::{Backend, Float};
 use smallem::cli::Args;
 use smallem::data::{Shards, bytes_per_token};
-use smallem::io::{SafeTensors, load_parameters};
-use smallem::model::{Gpt, GptConfig};
+use smallem::io::load_gpt;
 use smallem::ngram::{count_of, suffix, trigram_counts, trigram_key};
-use smallem::tokenizer::Bpe;
+use smallem::tokenizer::{Bpe, TOKENIZER_FILE};
 
 const BATCH: usize = 16;
 /// La graine des lots de validation, celle de l'entraînement.
@@ -60,7 +59,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             other => return Err(format!("option inconnue : {other}").into()),
         }
     }
-    let tokenizer = Bpe::load(data.join("tokenizer.bpe"))?;
+    let tokenizer = Bpe::load(data.join(TOKENIZER_FILE))?;
     let vocab = tokenizer.vocab_size();
     let val = Shards::open_dir(&data, ".val.bin")?;
     let bytes = bytes_per_token(&val, &tokenizer)?;
@@ -165,10 +164,8 @@ fn losses<B: Backend>(
     counts: &[(u64, u32)],
     vocab: usize,
 ) -> Result<Losses, Box<dyn Error>> {
-    let file = SafeTensors::read(path)?;
-    let config = GptConfig::from_metadata(&file.metadata)?.for_inference();
-    let mut model = Gpt::new(backend, config, &mut StdRng::seed_from_u64(0));
-    load_parameters(&file, backend, &mut model)?;
+    let model = load_gpt(backend, path, true)?;
+    let config = model.config();
     let mut result = Losses {
         on: vec![(0.0, 0); BUCKETS.len()],
         off: vec![(0.0, 0); BUCKETS.len()],

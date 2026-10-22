@@ -146,7 +146,7 @@ fn join(numbers: &[u32]) -> String {
         .join(" ")
 }
 
-const TRAINING_WORDS: &[&str] = &[
+pub(crate) const TRAINING_WORDS: &[&str] = &[
     "garden", "window", "river", "planet", "doctor", "pencil", "summer", "market", "orange",
     "silver", "forest", "bridge", "candle", "camera", "dragon", "engine", "farmer", "island",
     "jacket", "kitten", "ladder", "monkey", "number", "office", "parent", "rabbit", "school",
@@ -158,18 +158,18 @@ const TRAINING_WORDS: &[&str] = &[
     "world", "beach", "cloud", "field", "heart", "metal", "storm", "tiger", "voice",
 ];
 
-const EVALUATION_WORDS: &[&str] = &[
+pub(crate) const EVALUATION_WORDS: &[&str] = &[
     "butter", "kettle", "puzzle", "anchor", "pillow", "rescue", "shadow", "thread", "velvet",
     "walnut", "copper", "harbor", "marble", "needle", "saddle", "turtle", "carpet", "falcon",
     "goblet", "lantern",
 ];
 
-const NAMES: &[&str] = &[
+pub(crate) const NAMES: &[&str] = &[
     "Anna", "Paul", "Maria", "John", "Lucy", "Omar", "Elena", "David", "Sara", "Hugo", "Nina",
     "Peter", "Clara", "Leo", "Emma", "Victor",
 ];
 
-const CITIES: &[&str] = &[
+pub(crate) const CITIES: &[&str] = &[
     "Paris", "London", "Berlin", "Madrid", "Rome", "Tokyo", "Cairo", "Lima", "Oslo", "Dublin",
     "Vienna", "Boston",
 ];

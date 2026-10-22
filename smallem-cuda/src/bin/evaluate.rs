@@ -24,12 +24,11 @@ use rand::rngs::StdRng;
 use smallem::chat::Roles;
 use smallem::cli::Args;
 use smallem::data::{Shards, bytes_per_token};
-use smallem::io::{SafeTensors, load_parameters};
-use smallem::model::{Gpt, GptConfig};
+use smallem::io::load_gpt;
 use smallem::post_training::{Asking, accuracy, answer_all};
 use smallem::sampling::Sampling;
 use smallem::tasks::Family;
-use smallem::tokenizer::Bpe;
+use smallem::tokenizer::{Bpe, TOKENIZER_FILE};
 use smallem::training::validation_loss;
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -48,12 +47,10 @@ fn main() -> Result<(), Box<dyn Error>> {
             other => return Err(format!("option inconnue : {other}").into()),
         }
     }
-    let file = SafeTensors::read(&model_path)?;
-    let config = GptConfig::from_metadata(&file.metadata)?.for_inference();
     let gpu = smallem_cuda::gpu(true)?;
-    let mut model = Gpt::new(&gpu, config, &mut StdRng::seed_from_u64(0));
-    load_parameters(&file, &gpu, &mut model)?;
-    let tokenizer = Bpe::load(data.join("tokenizer.bpe"))?;
+    let model = load_gpt(&gpu, &model_path, true)?;
+    let config = model.config();
+    let tokenizer = Bpe::load(data.join(TOKENIZER_FILE))?;
     let validation = Shards::open_dir(&data, "val.bin")?;
     let bytes = bytes_per_token(&validation, &tokenizer)?;
 

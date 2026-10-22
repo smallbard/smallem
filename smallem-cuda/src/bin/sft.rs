@@ -35,16 +35,21 @@ use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
 use smallem::backend::{Float, Primitives};
 use smallem::chat::{self, Encoded, Roles};
-use smallem::cli::Args;
+use smallem::cli::{Args, at_least_one, check_positive, check_range};
 use smallem::data::{Batches, Shards, bytes_per_token};
-use smallem::io::{SafeTensors, load_parameters, save_model};
-use smallem::model::{Gpt, GptConfig};
+use smallem::io::{load_gpt, save_model};
+use smallem::model::Gpt;
 use smallem::optim::{AnyOptimizer, Optimizer, OptimizerKind, cosine_schedule};
 use smallem::post_training::{Asking, accuracy, sft_batch};
 use smallem::tasks::Family;
-use smallem::tokenizer::Bpe;
+use smallem::tokenizer::{Bpe, TOKENIZER_FILE};
 use smallem::training::{evaluate, train_step_clipped, validation_loss};
 use smallem_cuda::Cuda;
+
+/// Le modèle de départ, celui qu'on obtient et les données, par défaut.
+const DEFAULT_MODEL: &str = "../data/step11/muon-short-long.safetensors";
+const DEFAULT_OUT: &str = "../data/post/sft.safetensors";
+const DEFAULT_DATA: &str = "../data/bpe";
 
 struct Options {
     model: PathBuf,
@@ -64,11 +69,11 @@ struct Options {
 }
 
 impl Options {
-    fn parse() -> Result<Self, Box<dyn Error>> {
+    fn parse_from(mut args: Args) -> Result<Self, Box<dyn Error>> {
         let mut options = Self {
-            model: "../data/step11/muon-short-long.safetensors".into(),
-            out: "../data/post/sft.safetensors".into(),
-            data: "../data/bpe".into(),
+            model: DEFAULT_MODEL.into(),
+            out: DEFAULT_OUT.into(),
+            data: DEFAULT_DATA.into(),
             examples: 2000,
             steps: 1500,
             batch: 32,
@@ -81,7 +86,6 @@ impl Options {
             eval_every: 250,
             questions: 200,
         };
-        let mut args = Args::from_env();
         while let Some(flag) = args.next() {
             match flag.as_str() {
                 "--model" => options.model = args.value(&flag)?,
@@ -101,7 +105,31 @@ impl Options {
                 other => return Err(format!("option inconnue : {other}").into()),
             }
         }
+        at_least_one(&[
+            ("--examples", options.examples),
+            ("--steps", options.steps),
+            ("--batch", options.batch),
+            ("--length", options.length),
+            ("--eval-every", options.eval_every),
+            ("--questions", options.questions),
+            ("--lora", options.lora.unwrap_or(1)),
+        ])?;
+        check_positive("--lr", options.lr)?;
+        check_range("--mix", options.mix, 0.0..=1.0)?;
+        if options.rows().0 == 0 {
+            return Err(format!(
+                "--mix {} : il ne reste aucune conversation dans un lot de {}",
+                options.mix, options.batch
+            )
+            .into());
+        }
         Ok(options)
+    }
+
+    /// Les lignes d'un lot : `(conversations, FineWeb-Edu)`.
+    fn rows(&self) -> (usize, usize) {
+        let fineweb = (self.batch as f64 * self.mix).round() as usize;
+        (self.batch - fineweb, fineweb)
     }
 }
 
@@ -121,13 +149,10 @@ fn conversations(tokenizer: &Bpe, roles: Roles, count: usize, seed: u64) -> Vec<
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let options = Options::parse()?;
-    let file = SafeTensors::read(&options.model)?;
-    let config = GptConfig::from_metadata(&file.metadata)?.for_inference();
+    let options = Options::parse_from(Args::from_env())?;
     let gpu = smallem_cuda::gpu(true)?;
-    let mut model = Gpt::new(&gpu, config, &mut StdRng::seed_from_u64(0));
-    load_parameters(&file, &gpu, &mut model)?;
-    let tokenizer = Bpe::load(options.data.join("tokenizer.bpe"))?;
+    let mut model = load_gpt(&gpu, &options.model, true)?;
+    let tokenizer = Bpe::load(options.data.join(TOKENIZER_FILE))?;
     let roles = Roles::after(tokenizer.vocab_size());
     if model.config().vocab < roles.vocab() {
         model.grow_vocab(&gpu, roles.vocab());
@@ -158,8 +183,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         },
     );
 
-    let fineweb_rows = (options.batch as f64 * options.mix).round() as usize;
-    let chat_rows = options.batch - fineweb_rows;
+    let (chat_rows, fineweb_rows) = options.rows();
     let mut optimizer = AnyOptimizer::<Cuda>::new(OptimizerKind::AdamW, options.lr, 0.0);
     let mut rng = StdRng::seed_from_u64(3);
     // Les conversations d'entraînement, dans un ordre tiré à chaque époque.
@@ -273,4 +297,40 @@ fn main() -> Result<(), Box<dyn Error>> {
 
 fn gpu_item(gpu: &Cuda, tensor: &<Cuda as Primitives>::Tensor) -> f64 {
     gpu.item(tensor).to_f64()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn options(args: &[&str]) -> Result<Options, Box<dyn Error>> {
+        Options::parse_from(Args::new(
+            args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>(),
+        ))
+    }
+
+    #[test]
+    fn options_are_read_from_the_command_line() {
+        let options = options(&["--steps", "10", "--mix", "0.25", "--lora", "8"]).unwrap();
+        assert_eq!((options.steps, options.lora), (10, Some(8)));
+        assert_eq!(options.rows(), (24, 8));
+        assert_eq!(options.model, PathBuf::from(DEFAULT_MODEL));
+    }
+
+    #[test]
+    fn options_that_would_break_the_loop_are_refused() {
+        for (refused, flag) in [
+            (&["--eval-every", "0"][..], "--eval-every"),
+            (&["--steps", "0"], "--steps"),
+            (&["--lora", "0"], "--lora"),
+            (&["--lr", "-1e-4"], "--lr"),
+            (&["--mix", "1.5"], "--mix"),
+            (&["--mix", "1"], "--mix"),
+            (&["--batch", "1", "--mix", "0.6"], "--mix"),
+            (&["--epochs", "3"], "--epochs"),
+        ] {
+            let error = options(refused).err().expect(flag).to_string();
+            assert!(error.contains(flag), "{error}");
+        }
+    }
 }

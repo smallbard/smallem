@@ -29,15 +29,15 @@
 use std::error::Error;
 use std::path::PathBuf;
 
+use rand::SeedableRng;
 use rand::rngs::StdRng;
-use rand::{RngExt, SeedableRng};
 use smallem::autograd::Tape;
 use smallem::backend::{Float, Primitives};
 use smallem::chat::{Encoded, Roles};
-use smallem::cli::Args;
+use smallem::cli::{Args, at_least_one, check_positive, check_range};
 use smallem::data::{Shards, bytes_per_token};
-use smallem::io::{SafeTensors, load_parameters, save_model};
-use smallem::model::{Gpt, GptConfig};
+use smallem::io::{load_gpt, save_model};
+use smallem::model::Gpt;
 use smallem::optim::{AnyOptimizer, OptimizerKind};
 use smallem::post_training::{
     Asking, GrpoSettings, accuracy, answer_all, group_advantages, grpo_loss, sft_batch,
@@ -45,80 +45,141 @@ use smallem::post_training::{
 };
 use smallem::sampling::Sampling;
 use smallem::tasks::Family;
-use smallem::tokenizer::Bpe;
+use smallem::tokenizer::{Bpe, TOKENIZER_FILE};
 use smallem::training::{train_step_clipped, validation_loss};
 use smallem_cuda::Cuda;
 
-fn load(gpu: &Cuda, path: &PathBuf) -> Result<Gpt<Cuda>, Box<dyn Error>> {
-    let file = SafeTensors::read(path)?;
-    let config = GptConfig::from_metadata(&file.metadata)?.for_inference();
-    let mut model = Gpt::new(gpu, config, &mut StdRng::seed_from_u64(0));
-    load_parameters(&file, gpu, &mut model)?;
-    Ok(model)
+/// Le modèle de départ, celui qu'on obtient et les données, par défaut.
+const DEFAULT_MODEL: &str = "../data/post/sft.safetensors";
+const DEFAULT_OUT: &str = "../data/post/rl.safetensors";
+const DEFAULT_DATA: &str = "../data/bpe";
+
+struct Options {
+    model: PathBuf,
+    out: PathBuf,
+    data: PathBuf,
+    /// REINFORCE plutôt que GRPO.
+    reinforce: bool,
+    /// La tâche difficile, et la tâche ordinaire qui l'accompagne.
+    tasks: (Family, Family),
+    steps: usize,
+    prompts: usize,
+    group: usize,
+    inner: usize,
+    eval_every: usize,
+    lr: f64,
+    clip: f64,
+    kl: f64,
+    per_token: bool,
+}
+
+impl Options {
+    fn parse_from(mut args: Args) -> Result<Self, Box<dyn Error>> {
+        let mut options = Self {
+            model: DEFAULT_MODEL.into(),
+            out: DEFAULT_OUT.into(),
+            data: DEFAULT_DATA.into(),
+            reinforce: false,
+            tasks: (Family::LongSort, Family::Sort),
+            steps: 300,
+            prompts: 16,
+            group: 8,
+            inner: 1,
+            eval_every: 50,
+            lr: 2e-6,
+            clip: 0.2,
+            kl: 0.04,
+            per_token: false,
+        };
+        while let Some(flag) = args.next() {
+            match flag.as_str() {
+                "--model" => options.model = args.value(&flag)?,
+                "--out" => options.out = args.value(&flag)?,
+                "--data" => options.data = args.value(&flag)?,
+                "--method" => {
+                    options.reinforce = match args.value::<String>(&flag)?.as_str() {
+                        "reinforce" => true,
+                        "grpo" => false,
+                        other => return Err(format!("méthode inconnue : {other}").into()),
+                    }
+                }
+                "--steps" => options.steps = args.value(&flag)?,
+                "--prompts" => options.prompts = args.value(&flag)?,
+                "--group" => options.group = args.value(&flag)?,
+                "--lr" => options.lr = args.value(&flag)?,
+                "--clip" => options.clip = args.value(&flag)?,
+                "--kl" => options.kl = args.value(&flag)?,
+                "--per-token" => options.per_token = true,
+                "--inner" => options.inner = args.value(&flag)?,
+                "--eval-every" => options.eval_every = args.value(&flag)?,
+                "--task" => {
+                    options.tasks = match args.value::<String>(&flag)?.as_str() {
+                        "long-sort" => (Family::LongSort, Family::Sort),
+                        "long-addition" => (Family::LongAddition, Family::Addition),
+                        // Le tri ordinaire, que le fine-tuning a déjà à
+                        // moitié appris : un signal abondant, pour voir si
+                        // l'apprentissage par essais améliore ce qui est déjà
+                        // en partie su.
+                        "sort" => (Family::Sort, Family::Sort),
+                        other => return Err(format!("tâche inconnue : {other}").into()),
+                    }
+                }
+                other => return Err(format!("option inconnue : {other}").into()),
+            }
+        }
+        at_least_one(&[
+            ("--steps", options.steps),
+            ("--prompts", options.prompts),
+            ("--group", options.group),
+            ("--inner", options.inner),
+            ("--eval-every", options.eval_every),
+        ])?;
+        check_positive("--lr", options.lr)?;
+        check_positive("--clip", options.clip)?;
+        check_range("--kl", options.kl, 0.0..)?;
+        Ok(options)
+    }
+
+    /// Les réglages de la perte. REINFORCE : ni borne, ni divergence, et la
+    /// moyenne du groupe comme seule ligne de base.
+    fn settings(&self) -> GrpoSettings {
+        if self.reinforce {
+            GrpoSettings {
+                clip: f64::INFINITY,
+                kl: 0.0,
+                per_answer: false,
+            }
+        } else {
+            GrpoSettings {
+                clip: self.clip,
+                kl: self.kl,
+                per_answer: !self.per_token,
+            }
+        }
+    }
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let mut model_path: PathBuf = "../data/post/sft.safetensors".into();
-    let mut out: PathBuf = "../data/post/rl.safetensors".into();
-    let mut data: PathBuf = "../data/bpe".into();
-    let mut method = "grpo".to_string();
-    let mut task = "long-sort".to_string();
-    let (mut steps, mut prompts, mut group, mut inner, mut eval_every) =
-        (300usize, 16usize, 8usize, 1usize, 50usize);
-    let (mut lr, mut clip, mut kl, mut per_token) = (2e-6f64, 0.2f64, 0.04f64, false);
-    let mut args = Args::from_env();
-    while let Some(flag) = args.next() {
-        match flag.as_str() {
-            "--model" => model_path = args.value(&flag)?,
-            "--out" => out = args.value(&flag)?,
-            "--data" => data = args.value(&flag)?,
-            "--method" => method = args.value(&flag)?,
-            "--steps" => steps = args.value(&flag)?,
-            "--prompts" => prompts = args.value(&flag)?,
-            "--group" => group = args.value(&flag)?,
-            "--lr" => lr = args.value(&flag)?,
-            "--clip" => clip = args.value(&flag)?,
-            "--kl" => kl = args.value(&flag)?,
-            "--per-token" => per_token = true,
-            "--inner" => inner = args.value(&flag)?,
-            "--eval-every" => eval_every = args.value(&flag)?,
-            "--task" => task = args.value(&flag)?,
-            other => return Err(format!("option inconnue : {other}").into()),
-        }
-    }
-    let (hard, ordinary) = match task.as_str() {
-        "long-sort" => (Family::LongSort, Family::Sort),
-        "long-addition" => (Family::LongAddition, Family::Addition),
-        // Le tri ordinaire, que le fine-tuning a déjà à moitié appris : un
-        // signal abondant, pour voir si l'apprentissage par essais améliore
-        // ce qui est déjà en partie su.
-        "sort" => (Family::Sort, Family::Sort),
-        other => return Err(format!("tâche inconnue : {other}").into()),
-    };
-    let reinforce = match method.as_str() {
-        "reinforce" => true,
-        "grpo" => false,
-        other => return Err(format!("méthode inconnue : {other}").into()),
-    };
-    // REINFORCE : ni borne, ni divergence, et la moyenne du groupe comme
-    // seule ligne de base.
-    let settings = if reinforce {
-        GrpoSettings {
-            clip: f64::INFINITY,
-            kl: 0.0,
-            per_answer: false,
-        }
-    } else {
-        GrpoSettings {
-            clip,
-            kl,
-            per_answer: !per_token,
-        }
-    };
+    let options = Options::parse_from(Args::from_env())?;
+    let settings = options.settings();
+    let Options {
+        model: model_path,
+        out,
+        data,
+        reinforce,
+        tasks: (hard, ordinary),
+        steps,
+        prompts,
+        group,
+        inner,
+        eval_every,
+        lr,
+        ..
+    } = options;
     let gpu = smallem_cuda::gpu(true)?;
-    let mut model = load(&gpu, &model_path)?;
-    let reference = load(&gpu, &model_path)?;
-    let tokenizer = Bpe::load(data.join("tokenizer.bpe"))?;
+    let mut model = load_gpt(&gpu, &model_path, true)?;
+    let reference = load_gpt(&gpu, &model_path, true)?;
+    let tokenizer = Bpe::load(data.join(TOKENIZER_FILE))?;
     let roles = Roles::after(tokenizer.vocab_size());
     let asking = Asking::Chat(roles);
     let validation = Shards::open_dir(&data, "val.bin")?;
@@ -146,7 +207,10 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let mut optimizer = AnyOptimizer::<Cuda>::new(OptimizerKind::AdamW, lr, 0.0);
     let sampling = Sampling::default();
-    let (mut reward_sum, mut length_sum, mut kl_sum, mut seen) = (0.0, 0.0, 0.0, 0usize);
+    // Les sommes depuis le dernier compte rendu : récompenses et longueurs
+    // par réponse, divergence par pas.
+    let (mut reward_sum, mut length_sum, mut seen) = (0.0, 0.0, 0usize);
+    let (mut kl_sum, mut kl_steps) = (0.0, 0usize);
     for step in 0..steps {
         // Le lot de consignes, et `group` réponses tirées pour chacune.
         let turns: Vec<_> = (0..prompts)
@@ -221,6 +285,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             .map(|(lp, r)| (r - lp).exp() - (r - lp) - 1.0)
             .sum::<f64>()
             / old.len() as f64;
+        kl_steps += 1;
         // Les tailles des lots changent à chaque pas : la réserve de
         // tampons garderait un tampon de chaque taille.
         if step % 10 == 0 {
@@ -248,17 +313,55 @@ fn main() -> Result<(), Box<dyn Error>> {
                 step + 1,
                 reward_sum / answers,
                 length_sum / answers,
-                kl_sum / eval_every as f64,
+                kl_sum / kl_steps as f64,
             );
-            (reward_sum, length_sum, kl_sum, seen) = (0.0, 0.0, 0.0, 0);
+            (reward_sum, length_sum, seen) = (0.0, 0.0, 0);
+            (kl_sum, kl_steps) = (0.0, 0);
             report(step + 1, &model, &mut rng)?;
         }
     }
-    let _ = rng.random::<u8>();
     if let Some(parent) = out.parent() {
         std::fs::create_dir_all(parent)?;
     }
     save_model(&out, &gpu, &model, model.config().to_metadata())?;
     println!("modèle enregistré dans {}", out.display());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn options(args: &[&str]) -> Result<Options, Box<dyn Error>> {
+        Options::parse_from(Args::new(
+            args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>(),
+        ))
+    }
+
+    #[test]
+    fn options_are_read_from_the_command_line() {
+        let options =
+            options(&["--method", "reinforce", "--task", "sort", "--group", "4"]).unwrap();
+        assert!(options.reinforce);
+        assert_eq!(options.tasks, (Family::Sort, Family::Sort));
+        assert_eq!((options.group, options.steps), (4, 300));
+        assert_eq!(options.settings().kl, 0.0);
+        let grpo = self::options(&["--per-token"]).unwrap().settings();
+        assert!(!grpo.per_answer && grpo.clip == 0.2);
+    }
+
+    #[test]
+    fn options_that_would_break_the_loop_are_refused() {
+        for (refused, flag) in [
+            (&["--eval-every", "0"][..], "--eval-every"),
+            (&["--group", "0"], "--group"),
+            (&["--clip", "0"], "--clip"),
+            (&["--kl", "-1"], "--kl"),
+            (&["--method", "ppo"], "ppo"),
+            (&["--task", "chess"], "chess"),
+        ] {
+            let error = options(refused).err().expect(flag).to_string();
+            assert!(error.contains(flag), "{error}");
+        }
+    }
 }

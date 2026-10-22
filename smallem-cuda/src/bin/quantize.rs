@@ -29,12 +29,12 @@ use smallem::cli::Args;
 use smallem::data::Batches;
 use smallem::data::{Shards, bytes_per_token};
 use smallem::generation::{Batch, Generator};
-use smallem::io::{SafeTensors, load_parameters};
-use smallem::model::{Gpt, GptConfig};
+use smallem::io::{SafeTensors, gpt_from_file};
+use smallem::model::Gpt;
 use smallem::nn::Module;
 use smallem::quantize::{Format, Quantized};
 use smallem::sampling::Sampling;
-use smallem::tokenizer::Bpe;
+use smallem::tokenizer::{Bpe, TOKENIZER_FILE};
 use smallem::training::{evaluate, validation_loss};
 use smallem_cuda::Cuda;
 
@@ -189,8 +189,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     }
     let file = SafeTensors::read(&model_path)?;
-    let config = GptConfig::from_metadata(&file.metadata)?.for_inference();
-    let tokenizer = Bpe::load(data.join("tokenizer.bpe"))?;
+    let tokenizer = Bpe::load(data.join(TOKENIZER_FILE))?;
     let validation = Shards::open_dir(&data, "val.bin")?;
     let bytes = bytes_per_token(&validation, &tokenizer)?;
     let prompt: Vec<u32> = tokenizer
@@ -201,8 +200,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let gpu = smallem_cuda::gpu(false)?;
     let train = Shards::open_dir(&data, "train.bin")?;
     if outliers {
-        let mut model = Gpt::new(&gpu, config, &mut StdRng::seed_from_u64(0));
-        load_parameters(&file, &gpu, &mut model)?;
+        let model = gpt_from_file(&gpu, &file, true)?;
         return analyze_outliers(&gpu, &model, &train, 2);
     }
 
@@ -213,8 +211,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut reference: Option<(f64, Vec<u32>)> = None;
     for name in formats.split(',') {
         let format = parse_format(name)?;
-        let mut model = Gpt::new(&gpu, config, &mut StdRng::seed_from_u64(0));
-        load_parameters(&file, &gpu, &mut model)?;
+        let mut model = gpt_from_file(&gpu, &file, true)?;
         let f32_bytes: usize = model
             .parameters()
             .iter()

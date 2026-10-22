@@ -18,7 +18,7 @@ carte, ni du CUDA Toolkit.
 ## Compiler et tester
 
 ```bash
-cargo test                    # 449 tests, quelques secondes, sans GPU
+cargo test                    # 481 tests, quelques secondes, sans GPU
 cargo clippy --all-targets
 ```
 
@@ -31,6 +31,7 @@ cargo clippy --all-targets
 | `bigram` | modèle bigramme par comptage |
 | `fit` | ajuste les lois d'échelle sur les résultats de `sweep`, et prédit |
 | `cpubench` | ce que vaut le processeur, et ce qu'en tire le backend `Fast` |
+| `remote` | les missions d'agent jouées par un grand modèle servi en local (API de chat d'OpenAI) |
 | `ngrams` | compte les bigrammes et les trigrammes du corpus : couverture, collisions du hachage, modèles par comptage |
 
 Chaque programme décrit ses options en tête de son fichier, dans `src/bin/`. Ceux qui
@@ -90,8 +91,10 @@ src/
   speculative.rs                     le décodage spéculatif
   chat.rs, tasks.rs                  les conversations, et les tâches vérifiables
   post_training.rs                   évaluation, fine-tuning, DPO, GRPO
+  agent/                             un agent : la boucle, les outils, les missions,
+                                     un grand modèle servi en local
   flops.rs, scaling.rs               le compte des opérations, les lois d'échelle
   io.rs, gpt2.rs                     les fichiers de poids
   cli.rs                             la lecture des options
-  bin/                               prepare, bpe, bigram, fit, cpubench, ngrams
+  bin/                               prepare, bpe, bigram, fit, cpubench, ngrams, remote
 ```

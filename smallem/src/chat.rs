@@ -48,6 +48,39 @@ impl Roles {
     }
 }
 
+/// Les noms des deux tokens d'un agent, dans l'ordre de leurs numéros.
+pub const TOOL_NAMES: [&str; 2] = ["<|appel|>", "<|resultat|>"];
+
+/// Les numéros des deux tokens qui encadrent un appel d'outil :
+///
+/// ```text
+/// <|appel|> add 4821 3907 <|resultat|> 8728 <|assistant|>
+/// ```
+///
+/// Le modèle écrit `<|appel|>`, l'appel, puis `<|resultat|>` ; le programme
+/// écrit le résultat et rend la main par `<|assistant|>`. Ils suivent les
+/// tokens de rôle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ToolTokens {
+    pub call: u32,
+    pub result: u32,
+}
+
+impl ToolTokens {
+    /// Les deux tokens qui suivent ceux de `roles`.
+    pub fn after(roles: Roles) -> Self {
+        Self {
+            call: roles.end + 1,
+            result: roles.end + 2,
+        }
+    }
+
+    /// Le vocabulaire complet : le texte, les tokens de rôle, ces deux-là.
+    pub fn vocab(&self) -> usize {
+        self.result as usize + 1
+    }
+}
+
 /// Un tour de parole.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Turn {
@@ -89,7 +122,7 @@ pub fn encode(tokenizer: &Bpe, roles: Roles, turn: &Turn) -> Encoded {
 
 /// Le texte d'une réponse : ses tokens jusqu'au premier `<|fin|>`, les
 /// autres tokens de rôle laissés de côté.
-pub(crate) fn answer_text(tokenizer: &Bpe, roles: Roles, tokens: &[u32]) -> String {
+pub fn answer_text(tokenizer: &Bpe, roles: Roles, tokens: &[u32]) -> String {
     let text: Vec<u16> = tokens
         .iter()
         .take_while(|&&t| t != roles.end)

@@ -36,7 +36,7 @@
 
 use std::error::Error;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use rand::SeedableRng;
@@ -47,11 +47,11 @@ use smallem::backend::fast::Fast;
 use smallem::chat::{ROLE_NAMES, Roles};
 use smallem::cli::Args;
 use smallem::generation::Generator;
-use smallem::io::{SafeTensors, load_parameters};
-use smallem::model::{Gpt, GptConfig};
+use smallem::io::{SafeTensors, gpt_from_file};
+use smallem::model::GptConfig;
 use smallem::quantize::Format;
 use smallem::sampling::Sampling;
-use smallem::tokenizer::Bpe;
+use smallem::tokenizer::{Bpe, TOKENIZER_FILE};
 
 struct Options {
     model: PathBuf,
@@ -131,8 +131,8 @@ impl Options {
     /// trouve à côté du fichier de poids, sinon, en conversation, celui des
     /// données, sinon les octets.
     fn tokenizer(&self) -> Result<Bpe, Box<dyn Error>> {
-        let beside = self.model.with_file_name("tokenizer.bpe");
-        let data = PathBuf::from("../data/bpe/tokenizer.bpe");
+        let beside = self.model.with_file_name(TOKENIZER_FILE);
+        let data = Path::new("../data/bpe").join(TOKENIZER_FILE);
         match &self.tokenizer {
             Some(path) => Ok(Bpe::load(path)?),
             None if beside.exists() => Ok(Bpe::load(beside)?),
@@ -157,7 +157,7 @@ fn run<B: Backend>(
     if expected != config.vocab {
         let hint = if options.chat {
             "ce modèle n'a pas de tokens de rôle, ou préciser --tokenizer"
-        } else if Bpe::load("../data/bpe/tokenizer.bpe")
+        } else if Bpe::load(Path::new("../data/bpe").join(TOKENIZER_FILE))
             .is_ok_and(|data| Roles::after(data.vocab_size()).vocab() == config.vocab)
         {
             "un modèle post-entraîné : ajouter --chat"
@@ -170,11 +170,10 @@ fn run<B: Backend>(
         )
         .into());
     }
-    // Les poids tirés ici sont aussitôt remplacés par ceux du fichier. Ils
-    // ont leur propre générateur : celui du tirage des tokens ne doit pas
-    // dépendre du nombre de paramètres du modèle.
-    let mut model = Gpt::new(backend, config, &mut StdRng::seed_from_u64(0));
-    load_parameters(file, backend, &mut model)?;
+    // Les poids tirés à la construction sont aussitôt remplacés par ceux du
+    // fichier, avec leur propre générateur : celui du tirage des tokens ne
+    // dépend pas du nombre de paramètres du modèle.
+    let mut model = gpt_from_file(backend, file, true)?;
     if let Some(format) = options.quantize {
         model.quantize(backend, format);
         if options.quantize_output {

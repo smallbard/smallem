@@ -33,6 +33,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
 
+use smallem::cli::{Args, positional};
+
 /// Ce qu'on lit dans le journal d'un entraînement.
 #[derive(Debug, Default)]
 struct Outcome {
@@ -87,15 +89,10 @@ fn done(results: &Path) -> Vec<String> {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let mut args = std::env::args().skip(1);
-    let plan: PathBuf = args
-        .next()
-        .ok_or("usage : sweep PLAN DOSSIER [options]")?
-        .into();
-    let dir: PathBuf = args
-        .next()
-        .ok_or("usage : sweep PLAN DOSSIER [options]")?
-        .into();
+    const USAGE: &str = "usage : sweep PLAN DOSSIER [options]";
+    let mut args = Args::from_env();
+    let plan = PathBuf::from(positional(&args.next().ok_or(USAGE)?)?);
+    let dir = PathBuf::from(positional(&args.next().ok_or(USAGE)?)?);
     let common: Vec<String> = args.collect();
     fs::create_dir_all(&dir)?;
     let results = dir.join("results.tsv");

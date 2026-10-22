@@ -1,6 +1,12 @@
 //! Entraîne le modèle de langage à contexte fixe sur FineWeb-Edu.
 //!
-//! Usage : `cargo oxide run --bin mlp -- [gpu|cpu] [pas] [dossier_des_données]`
+//! Usage : `cargo oxide run --bin mlp -- [options]`
+//!
+//! ```text
+//! --cpu              sur le backend de référence du processeur, sans la carte
+//! --steps N          pas (défaut : 20 000)
+//! --data DOSSIER     où trouver train.bin et val.bin (défaut : ../data)
+//! ```
 
 use std::error::Error;
 use std::path::PathBuf;
@@ -11,6 +17,7 @@ use rand::rngs::StdRng;
 use smallem::autograd::Tape;
 use smallem::backend::cpu::Cpu;
 use smallem::backend::{Backend, Float};
+use smallem::cli::{Args, at_least_one};
 use smallem::data::Dataset;
 use smallem::mlp::{Mlp, MlpConfig, next_token_examples};
 use smallem::nn::Module;
@@ -136,20 +143,24 @@ fn run<B: Backend>(
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let mut args = std::env::args().skip(1);
-    let device = args.next().unwrap_or_else(|| "gpu".into());
-    let steps = match args.next() {
-        Some(steps) => steps.parse()?,
-        None => DEFAULT_STEPS,
-    };
-    let data_dir = PathBuf::from(args.next().unwrap_or_else(|| "../data".into()));
+    let (mut cpu, mut steps, mut data_dir) = (false, DEFAULT_STEPS, PathBuf::from("../data"));
+    let mut args = Args::from_env();
+    while let Some(flag) = args.next() {
+        match flag.as_str() {
+            "--cpu" => cpu = true,
+            "--steps" => steps = args.value(&flag)?,
+            "--data" => data_dir = args.value(&flag)?,
+            other => return Err(format!("option inconnue : {other}").into()),
+        }
+    }
+    at_least_one(&[("--steps", steps)])?;
 
     let train = Dataset::load(data_dir.join("train.bin"))?;
     let val = Dataset::load(data_dir.join("val.bin"))?;
 
-    match device.as_str() {
-        "gpu" => run(&Cuda::new(0)?, steps, &train, &val),
-        "cpu" => run(&Cpu::<f32>::new(), steps, &train, &val),
-        other => Err(format!("appareil inconnu : {other} (attendu : gpu ou cpu)").into()),
+    if cpu {
+        run(&Cpu::<f32>::new(), steps, &train, &val)
+    } else {
+        run(&Cuda::new(0)?, steps, &train, &val)
     }
 }

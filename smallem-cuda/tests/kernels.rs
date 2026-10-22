@@ -297,7 +297,10 @@ macro_rules! check_product {
 
 /// Comme `check_product!`, sur des entrées données.
 macro_rules! check_product_of {
-    ($inputs:expr, |$b:ident, $t:ident| $op:expr) => {{
+    ($inputs:expr, |$b:ident, $t:ident| $op:expr) => {
+        check_product_of!(Cuda::new(0).unwrap(); $inputs, |$b, $t| $op)
+    };
+    ($gpu:expr; $inputs:expr, |$b:ident, $t:ident| $op:expr) => {{
         let inputs: Vec<Input> = $inputs;
         let absolute: Vec<Input> = inputs
             .iter()
@@ -305,7 +308,7 @@ macro_rules! check_product_of {
             .collect();
         let cpu = eval(&Cpu::<f32>::new(), &inputs, |$b, $t| $op);
         let bound = eval(&Cpu::<f32>::new(), &absolute, |$b, $t| $op);
-        let gpu = eval(&Cuda::new(0).unwrap(), &inputs, |$b, $t| $op);
+        let gpu = eval(&$gpu, &inputs, |$b, $t| $op);
         assert_eq!(cpu.1, gpu.1, "formes différentes");
         let shapes: Vec<&Vec<usize>> = inputs.iter().map(|(_, shape)| shape).collect();
         for ((&c, &g), &scale) in cpu.0.iter().zip(&gpu.0).zip(&bound.0) {
@@ -1211,4 +1214,64 @@ fn quantized_matmul_reads_the_codes_like_the_reference() {
                 .run(&op, &[&t[0], &t[1], &t[2], &t[3], &t[4]]));
         }
     }
+}
+
+#[test]
+fn write_rows_ignores_rows_outside_the_table() {
+    // Le cache ne donne que des lignes de la table ; un indice faux n'écrit
+    // rien plutôt que d'écrire ailleurs sur la carte.
+    let inputs = random_inputs(&[&[4, 3], &[4, 3]], 0);
+    let b = Cuda::new(0).unwrap();
+    let mut table = b.from_vec(inputs[0].0.clone(), &inputs[0].1);
+    let indices = b.from_vec(vec![2.0, 4.0, 1e9, -1.0], &[4]);
+    b.write_rows(
+        &mut table,
+        &indices,
+        &b.from_vec(inputs[1].0.clone(), &inputs[1].1),
+    );
+    let (table, before, rows) = (b.to_vec(&table), &inputs[0].0, &inputs[1].0);
+    // -1 devient la ligne 0, comme toute valeur négative.
+    assert_eq!(&table[..3], &rows[9..]);
+    assert_eq!(&table[3..6], &before[3..6]);
+    assert_eq!(&table[6..9], &rows[..3]);
+    assert_eq!(&table[9..], &before[9..]);
+}
+
+#[test]
+fn transposed_matmul_of_many_rows_by_the_narrow_kernel() {
+    use smallem::backend::ops::{Run, TransposedMatmul};
+    // Avec la frontière repoussée, le kernel des matrices étroites reçoit
+    // 40 lignes : plus que `NARROW_ROWS`, et pas un multiple de 8.
+    let inputs = random_inputs(&[&[2, 20, 70], &[33, 70]], 0);
+    check_product_of!(Cuda::new(0).unwrap().with_narrow_rows(usize::MAX); inputs, |b, t| b
+        .run(&TransposedMatmul, &[&t[0], &t[1]]));
+}
+
+#[test]
+#[should_panic(expected = "échelles de forme inattendue")]
+fn quantized_matmul_checks_the_scales() {
+    use smallem::backend::ops::{QuantizedMatmul, Run};
+    use smallem::quantize::{Format, Quantized};
+    let (inner, cols) = (64, 8);
+    let (_, groups, per_group) = Quantized::layout(Format::Int8, inner);
+    let b = Cuda::new(0).unwrap();
+    let x = b.ones(&[1, inner]);
+    let words = b.zeros(&[groups * per_group, cols]);
+    let scales = b.ones(&[groups + 1, cols]);
+    let dequantized = b.zeros(&[inner, cols]);
+    b.run(
+        &QuantizedMatmul {
+            format: Format::Int8,
+        },
+        &[&x, &words, &scales, &dequantized],
+    );
+}
+
+#[test]
+#[should_panic(expected = "affine : [3] · [3]")]
+fn affine_checks_the_weight_before_reading_it() {
+    // Un poids à une dimension : sa forme n'a pas de seconde dimension à
+    // lire.
+    let b = Cuda::new(0).unwrap();
+    b.affine(&b.ones(&[3]), &b.ones(&[3]), &b.ones(&[3]));
 }

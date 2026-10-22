@@ -23,7 +23,7 @@ kernels pour la carte.
 
 ```bash
 cargo oxide build
-cargo oxide test              # 143 tests, sur la carte
+cargo oxide test              # 156 tests, sur la carte
 cargo clippy --all-targets    # l'analyse, elle, se passe de cargo oxide
 ```
 
@@ -51,6 +51,7 @@ entraînement.
 | `serve` | simulateur de service : politiques statique, continue, par pages |
 | `evaluate` | précision d'un modèle sur les tâches vérifiables |
 | `sft`, `dpo`, `rl` | fine-tuning supervisé, DPO, GRPO |
+| `agent` | un agent qui appelle des outils : jouer, évaluer, fine-tuning sur des traces, GRPO dans la boucle |
 | `sweep` | lance une grille d'entraînements et note les résultats |
 | `mfu` | rendement en opérations de la carte, par taille de modèle |
 | `noise` | bruit du gradient et taille de lot critique |
@@ -65,8 +66,11 @@ référence (`--cpu`).
 
 ```text
 src/
-  kernels.rs     le code qui tourne sur la carte
-  cuda.rs        le backend : tenseurs sur la carte, lancement des kernels
+  kernels/       le code qui tourne sur la carte, une famille par fichier :
+                 elementwise, rows, matmul, quantized, attention,
+                 attention_bf16, cached ; ce qu'elles partagent dans mod.rs
+  cuda/          le backend : tenseurs et réserve de tampons (mod.rs), puis
+                 les lancements, rangés comme les kernels
   ops.rs         les opérations de smallem::backend::ops sur GPU
   profile.rs     un backend GPU qui chronomètre
   bin/           les programmes

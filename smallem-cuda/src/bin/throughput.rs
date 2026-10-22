@@ -38,8 +38,7 @@ use smallem::backend::fast::Fast;
 use smallem::cli::Args;
 use smallem::data::Dataset;
 use smallem::generation::{Batch, generate};
-use smallem::io::{SafeTensors, load_parameters};
-use smallem::model::{Gpt, GptConfig};
+use smallem::io::load_gpt;
 use smallem::quantize::Format;
 use smallem::sampling::Sampling;
 
@@ -128,11 +127,8 @@ fn main() -> Result<(), Box<dyn Error>> {
 fn run<B: Backend>(backend: &B, options: &Options) -> Result<(), Box<dyn Error>> {
     let (prompt_len, tokens, check) = (options.prompt, options.tokens, options.check);
     let batches = &options.batches;
-    let file = SafeTensors::read(&options.model)?;
-    let config = GptConfig::from_metadata(&file.metadata)?.for_inference();
     let gpu = backend;
-    let mut model = Gpt::new(gpu, config, &mut StdRng::seed_from_u64(0));
-    load_parameters(&file, gpu, &mut model)?;
+    let mut model = load_gpt(gpu, &options.model, true)?;
     if options.memory_host {
         let memory = model
             .memory_mut()

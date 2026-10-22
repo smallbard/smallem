@@ -6,7 +6,10 @@
 //! par lots, selon le nombre de lignes, avec le kernel des matrices
 //! étroites et avec les kernels en tuiles.
 //!
-//! Usage : `cargo oxide run --bin matmul -- [generation]`
+//! Avec `quantized`, compare les produits de la génération sur des poids
+//! quantifiés en int8 et en int4 à ceux des poids en `f32`.
+//!
+//! Usage : `cargo oxide run --bin matmul -- [generation|quantized]`
 
 use std::error::Error;
 use std::time::Instant;
@@ -14,6 +17,7 @@ use std::time::Instant;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use smallem::backend::Primitives;
+use smallem::cli::Args;
 use smallem_cuda::Cuda;
 
 /// Les formes rencontrées avec un lot de 16 séquences de 512 tokens,
@@ -147,11 +151,18 @@ fn quantized() -> Result<(), Box<dyn Error>> {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    if std::env::args().any(|arg| arg == "generation") {
-        return generation();
+    let mut args = Args::from_env();
+    let mode = args.next();
+    if let Some(extra) = args.next() {
+        return Err(format!("argument en trop : {extra}").into());
     }
-    if std::env::args().any(|arg| arg == "quantized") {
-        return quantized();
+    match mode.as_deref() {
+        None => {}
+        Some("generation") => return generation(),
+        Some("quantized") => return quantized(),
+        Some(other) => {
+            return Err(format!("mesure inconnue : {other} (generation ou quantized)").into());
+        }
     }
     let exact = smallem_cuda::gpu(false)?;
     let mixed = smallem_cuda::gpu(true)?;

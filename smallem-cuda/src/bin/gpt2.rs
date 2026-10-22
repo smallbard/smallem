@@ -21,6 +21,7 @@ use rand::rngs::StdRng;
 use smallem::autograd::Tape;
 use smallem::backend::cpu::Cpu;
 use smallem::backend::{Backend, Float};
+use smallem::cli::{Args, positional};
 use smallem::generation::generate;
 use smallem::gpt2::{GPT2_SMALL, convert};
 use smallem::io::{SafeTensors, load_parameters};
@@ -116,11 +117,11 @@ fn run<B: Backend>(backend: &B, directory: &Path) -> Result<bool, Box<dyn Error>
 fn main() -> Result<(), Box<dyn Error>> {
     let mut cpu = false;
     let mut directory = PathBuf::from("../data/gpt2");
-    for arg in std::env::args().skip(1) {
+    for arg in Args::from_env() {
         if arg == "--cpu" {
             cpu = true;
         } else {
-            directory = arg.into();
+            directory = positional(&arg)?.into();
         }
     }
     let ok = if cpu {

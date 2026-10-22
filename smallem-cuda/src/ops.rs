@@ -257,6 +257,19 @@ impl Run<Affine> for Cuda {
     ) -> Vec<Option<Self::Tensor>> {
         op.reference_backward(self, inputs, output, grad)
     }
+
+    /// Seulement les gradients attendus (voir `Run::run_backward_needed`).
+    fn run_backward_needed(
+        &self,
+        op: &Affine,
+        inputs: &[&Self::Tensor],
+        output: &Self::Tensor,
+        _: Option<&Self::Tensor>,
+        grad: &Self::Tensor,
+        needed: &[bool],
+    ) -> Vec<Option<Self::Tensor>> {
+        op.reference_backward_needed(self, inputs, output, grad, needed)
+    }
 }
 
 /// Un kernel pour les produits de quelques lignes, ceux de la génération.
@@ -283,6 +296,19 @@ impl Run<TransposedMatmul> for Cuda {
     ) -> Vec<Option<Self::Tensor>> {
         op.reference_backward(self, inputs, output, grad)
     }
+
+    /// Seulement les gradients attendus (voir `Run::run_backward_needed`).
+    fn run_backward_needed(
+        &self,
+        op: &TransposedMatmul,
+        inputs: &[&Self::Tensor],
+        output: &Self::Tensor,
+        _: Option<&Self::Tensor>,
+        grad: &Self::Tensor,
+        needed: &[bool],
+    ) -> Vec<Option<Self::Tensor>> {
+        op.reference_backward_needed(self, inputs, output, grad, needed)
+    }
 }
 
 /// La forme compacte des poids pour les produits de la génération, la
@@ -301,6 +327,19 @@ impl Run<QuantizedMatmul> for Cuda {
         grad: &Self::Tensor,
     ) -> Vec<Option<Self::Tensor>> {
         op.reference_backward(self, inputs, output, grad)
+    }
+
+    /// Seulement les gradients attendus (voir `Run::run_backward_needed`).
+    fn run_backward_needed(
+        &self,
+        op: &QuantizedMatmul,
+        inputs: &[&Self::Tensor],
+        output: &Self::Tensor,
+        _: Option<&Self::Tensor>,
+        grad: &Self::Tensor,
+        needed: &[bool],
+    ) -> Vec<Option<Self::Tensor>> {
+        op.reference_backward_needed(self, inputs, output, grad, needed)
     }
 }
 

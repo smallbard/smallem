@@ -17,7 +17,7 @@ use smallem::nn::{
 };
 use smallem::optim::AdamW;
 use smallem::sampling::Sampling;
-use smallem::training::{evaluate, train_step, train_step_accumulated, train_step_observed};
+use smallem::training::{evaluate, train_step, train_step_accumulated};
 use smallem_cuda::Cuda;
 
 const VOCAB: usize = 257;
@@ -699,14 +699,13 @@ fn memory_loss_curve<B: Backend<Scalar = f32>>(
         .map(|_| {
             let batch = dataset.sample_batch(&mut rng, 8, config.context);
             let (tokens, targets) = batch.examples();
-            let (loss, _) = train_step_observed(
+            let (loss, _) = train_step_accumulated(
                 backend,
                 &mut model,
                 &mut optimizer,
                 f64::INFINITY,
                 1,
                 |m, t, _| m.training_loss(t, &tokens, &targets, 8),
-                |m, tape, grads| m.collect_memory_gradient(tape, grads),
             );
             model.apply_memory_gradient(backend, 3e-3, 1.0);
             backend.item(&loss).to_f64()

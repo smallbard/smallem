@@ -13,6 +13,7 @@
 //! --steps N          pas (défaut : 600)
 //! --pairs N          paires par lot (défaut : 32)
 //! --lr X             (défaut : 2e-5)
+//! --warmup N         pas de montée du taux (défaut : 20)
 //! --eval-every N     (défaut : 100)
 //! --nll X            ajoute X fois la log-vraisemblance négative moyenne des réponses
 //!                    préférées, par token (défaut : 0)
@@ -25,23 +26,23 @@
 use std::error::Error;
 use std::path::PathBuf;
 
+use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
-use rand::{RngExt, SeedableRng};
 use smallem::autograd::Tape;
 use smallem::backend::{Float, Primitives};
 use smallem::chat::{Encoded, Roles};
-use smallem::cli::Args;
+use smallem::cli::{Args, at_least_one, check_positive, check_range};
 use smallem::data::{Shards, bytes_per_token};
-use smallem::io::{SafeTensors, load_parameters, save_model};
-use smallem::model::{Gpt, GptConfig};
+use smallem::io::{load_gpt, save_model};
+use smallem::model::Gpt;
 use smallem::optim::{AnyOptimizer, Optimizer, OptimizerKind, cosine_schedule};
 use smallem::post_training::{
     Asking, SftBatch, accuracy, answer_all, dpo_loss, sequence_log_probs, sft_batch,
 };
 use smallem::sampling::Sampling;
 use smallem::tasks::Family;
-use smallem::tokenizer::Bpe;
+use smallem::tokenizer::{Bpe, TOKENIZER_FILE};
 use smallem::training::{train_step_clipped, validation_loss};
 use smallem_cuda::Cuda;
 
@@ -51,14 +52,6 @@ struct Pair {
     prompt: Vec<u32>,
     preferred: Vec<u32>,
     rejected: Vec<u32>,
-}
-
-fn load(gpu: &Cuda, path: &PathBuf) -> Result<Gpt<Cuda>, Box<dyn Error>> {
-    let file = SafeTensors::read(path)?;
-    let config = GptConfig::from_metadata(&file.metadata)?.for_inference();
-    let mut model = Gpt::new(gpu, config, &mut StdRng::seed_from_u64(0));
-    load_parameters(&file, gpu, &mut model)?;
-    Ok(model)
 }
 
 /// Les paires d'une famille : `count` consignes tirées avec la graine
@@ -165,34 +158,92 @@ fn log_probs(gpu: &Cuda, model: &Gpt<Cuda>, pairs: &[Pair]) -> Vec<f64> {
         .collect()
 }
 
-fn main() -> Result<(), Box<dyn Error>> {
-    let mut model_path: PathBuf = "../data/post/sft.safetensors".into();
-    let mut out: PathBuf = "../data/post/dpo.safetensors".into();
-    let mut data: PathBuf = "../data/bpe".into();
-    let (mut prompts, mut samples, mut steps, mut batch_pairs, mut eval_every) =
-        (1500usize, 8usize, 600usize, 32usize, 100usize);
-    let (mut beta, mut lr, mut nll) = (0.1f64, 2e-5f64, 0.0f64);
-    let mut args = Args::from_env();
-    while let Some(flag) = args.next() {
-        match flag.as_str() {
-            "--model" => model_path = args.value(&flag)?,
-            "--out" => out = args.value(&flag)?,
-            "--data" => data = args.value(&flag)?,
-            "--prompts" => prompts = args.value(&flag)?,
-            "--samples" => samples = args.value(&flag)?,
-            "--beta" => beta = args.value(&flag)?,
-            "--steps" => steps = args.value(&flag)?,
-            "--pairs" => batch_pairs = args.value(&flag)?,
-            "--lr" => lr = args.value(&flag)?,
-            "--eval-every" => eval_every = args.value(&flag)?,
-            "--nll" => nll = args.value(&flag)?,
-            other => return Err(format!("option inconnue : {other}").into()),
+/// Le modèle de départ, celui qu'on obtient et les données, par défaut.
+const DEFAULT_MODEL: &str = "../data/post/sft.safetensors";
+const DEFAULT_OUT: &str = "../data/post/dpo.safetensors";
+const DEFAULT_DATA: &str = "../data/bpe";
+
+struct Options {
+    model: PathBuf,
+    out: PathBuf,
+    data: PathBuf,
+    prompts: usize,
+    samples: usize,
+    steps: usize,
+    pairs: usize,
+    warmup: usize,
+    eval_every: usize,
+    beta: f64,
+    lr: f64,
+    nll: f64,
+}
+
+impl Options {
+    fn parse_from(mut args: Args) -> Result<Self, Box<dyn Error>> {
+        let mut options = Self {
+            model: DEFAULT_MODEL.into(),
+            out: DEFAULT_OUT.into(),
+            data: DEFAULT_DATA.into(),
+            prompts: 1500,
+            samples: 8,
+            steps: 600,
+            pairs: 32,
+            warmup: 20,
+            eval_every: 100,
+            beta: 0.1,
+            lr: 2e-5,
+            nll: 0.0,
+        };
+        while let Some(flag) = args.next() {
+            match flag.as_str() {
+                "--model" => options.model = args.value(&flag)?,
+                "--out" => options.out = args.value(&flag)?,
+                "--data" => options.data = args.value(&flag)?,
+                "--prompts" => options.prompts = args.value(&flag)?,
+                "--samples" => options.samples = args.value(&flag)?,
+                "--beta" => options.beta = args.value(&flag)?,
+                "--steps" => options.steps = args.value(&flag)?,
+                "--pairs" => options.pairs = args.value(&flag)?,
+                "--lr" => options.lr = args.value(&flag)?,
+                "--warmup" => options.warmup = args.value(&flag)?,
+                "--eval-every" => options.eval_every = args.value(&flag)?,
+                "--nll" => options.nll = args.value(&flag)?,
+                other => return Err(format!("option inconnue : {other}").into()),
+            }
         }
+        at_least_one(&[
+            ("--prompts", options.prompts),
+            ("--samples", options.samples),
+            ("--steps", options.steps),
+            ("--pairs", options.pairs),
+            ("--eval-every", options.eval_every),
+        ])?;
+        check_positive("--beta", options.beta)?;
+        check_positive("--lr", options.lr)?;
+        check_range("--nll", options.nll, 0.0..)?;
+        Ok(options)
     }
+}
+
+fn main() -> Result<(), Box<dyn Error>> {
+    let Options {
+        model: model_path,
+        out,
+        data,
+        prompts,
+        samples,
+        steps,
+        pairs: batch_pairs,
+        warmup,
+        eval_every,
+        beta,
+        lr,
+        nll,
+    } = Options::parse_from(Args::from_env())?;
     let gpu = smallem_cuda::gpu(true)?;
-    let mut model = load(&gpu, &model_path)?;
-    let reference = load(&gpu, &model_path)?;
-    let tokenizer = Bpe::load(data.join("tokenizer.bpe"))?;
+    let mut model = load_gpt(&gpu, &model_path, true)?;
+    let reference = load_gpt(&gpu, &model_path, true)?;
+    let tokenizer = Bpe::load(data.join(TOKENIZER_FILE))?;
     let roles = Roles::after(tokenizer.vocab_size());
     let validation = Shards::open_dir(&data, "val.bin")?;
     let bytes = bytes_per_token(&validation, &tokenizer)?;
@@ -202,6 +253,13 @@ fn main() -> Result<(), Box<dyn Error>> {
         &gpu, &model, &tokenizer, roles, prompts, samples, 5, &mut rng,
     );
     let held_out = pairs(&gpu, &model, &tokenizer, roles, 100, samples, 6, &mut rng);
+    if train.len() < batch_pairs {
+        return Err(format!(
+            "{} paires d'entraînement, moins que --pairs {batch_pairs}",
+            train.len()
+        )
+        .into());
+    }
     println!(
         "{} paires d'entraînement, {} de validation, β = {beta}",
         train.len(),
@@ -285,7 +343,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         if step % 10 == 0 {
             gpu.release_memory();
         }
-        optimizer.set_learning_rate(cosine_schedule(step, 20, steps, lr, 0.1 * lr));
+        optimizer.set_learning_rate(cosine_schedule(step, warmup, steps, lr, 0.1 * lr));
         let (batch, count) = rows(chunk);
         // Le nombre de tokens des réponses préférées, pour le terme de
         // vraisemblance.
@@ -308,11 +366,42 @@ fn main() -> Result<(), Box<dyn Error>> {
             report(step + 1, &model, &mut rng)?;
         }
     }
-    let _ = rng.random::<u8>();
     if let Some(parent) = out.parent() {
         std::fs::create_dir_all(parent)?;
     }
     save_model(&out, &gpu, &model, model.config().to_metadata())?;
     println!("modèle enregistré dans {}", out.display());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn options(args: &[&str]) -> Result<Options, Box<dyn Error>> {
+        Options::parse_from(Args::new(
+            args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>(),
+        ))
+    }
+
+    #[test]
+    fn options_are_read_from_the_command_line() {
+        let options = options(&["--beta", "0.5", "--warmup", "0", "--nll", "1"]).unwrap();
+        assert_eq!((options.beta, options.warmup, options.nll), (0.5, 0, 1.0));
+        assert_eq!((options.pairs, options.steps), (32, 600));
+    }
+
+    #[test]
+    fn options_that_would_break_the_loop_are_refused() {
+        for (refused, flag) in [
+            (&["--eval-every", "0"][..], "--eval-every"),
+            (&["--pairs", "0"], "--pairs"),
+            (&["--beta", "0"], "--beta"),
+            (&["--nll", "-0.5"], "--nll"),
+            (&["--lr", "inf"], "--lr"),
+        ] {
+            let error = options(refused).err().expect(flag).to_string();
+            assert!(error.contains(flag), "{error}");
+        }
+    }
 }

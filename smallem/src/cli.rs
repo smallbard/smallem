@@ -53,6 +53,36 @@ pub fn positional(arg: &str) -> Result<&str, Box<dyn Error>> {
     }
 }
 
+/// Refuse une option entière qui vaut 0, comme `--steps 0` ou
+/// `--eval-every 0` : la boucle ne ferait rien, ou un reste diviserait par
+/// zéro. L'erreur nomme la première option fautive.
+pub fn at_least_one(options: &[(&str, usize)]) -> Result<(), Box<dyn Error>> {
+    match options.iter().find(|(_, value)| *value == 0) {
+        Some((flag, _)) => Err(format!("{flag} doit valoir au moins 1").into()),
+        None => Ok(()),
+    }
+}
+
+/// Refuse un réel qui n'est pas fini ou qui sort de `range`, comme un taux
+/// d'apprentissage négatif ou une proportion au-delà de 1.
+pub fn check_range(
+    flag: &str,
+    value: f64,
+    range: impl std::ops::RangeBounds<f64>,
+) -> Result<(), Box<dyn Error>> {
+    if value.is_finite() && range.contains(&value) {
+        Ok(())
+    } else {
+        Err(format!("{flag} : valeur {value} refusée").into())
+    }
+}
+
+/// Refuse un réel qui n'est pas fini et strictement positif.
+pub fn check_positive(flag: &str, value: f64) -> Result<(), Box<dyn Error>> {
+    use std::ops::Bound;
+    check_range(flag, value, (Bound::Excluded(0.0), Bound::Unbounded))
+}
+
 impl Iterator for Args {
     type Item = String;
 
@@ -104,6 +134,20 @@ mod tests {
             invalid.starts_with("--steps : valeur `beaucoup` refusée"),
             "{invalid}"
         );
+    }
+
+    #[test]
+    fn zero_counts_and_values_out_of_range_are_refused() {
+        assert!(at_least_one(&[("--steps", 3), ("--batch", 1)]).is_ok());
+        let error = at_least_one(&[("--steps", 3), ("--eval-every", 0)]).unwrap_err();
+        assert_eq!(error.to_string(), "--eval-every doit valoir au moins 1");
+        assert!(check_range("--mix", 0.0, 0.0..1.0).is_ok());
+        assert!(check_range("--mix", 1.0, 0.0..1.0).is_err());
+        assert!(check_range("--mix", f64::NAN, 0.0..1.0).is_err());
+        assert!(check_positive("--lr", 1e-4).is_ok());
+        let error = check_positive("--lr", 0.0).unwrap_err().to_string();
+        assert_eq!(error, "--lr : valeur 0 refusée");
+        assert!(check_positive("--lr", f64::INFINITY).is_err());
     }
 
     #[test]

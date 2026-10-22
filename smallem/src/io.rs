@@ -285,7 +285,7 @@ pub fn gpt_from_file<B: Backend>(
     if inference {
         config = config.for_inference();
     }
-    let mut model = Gpt::new(backend, config, &mut StdRng::seed_from_u64(0));
+    let mut model = Gpt::try_new(backend, config, &mut StdRng::seed_from_u64(0))?;
     load_parameters(file, backend, &mut model)?;
     Ok(model)
 }

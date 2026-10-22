@@ -1,7 +1,9 @@
 //! Mesure le débit d'entraînement du Transformer sur GPU, en tokens par
 //! seconde, pour les trois configurations.
 //!
-//! Usage : `cargo oxide run --bin bench -- [dossier_des_données]`
+//! Usage : `cargo oxide run --bin bench -- [--data DOSSIER]`
+//!
+//! Le dossier des données vaut `../data` par défaut.
 
 use std::error::Error;
 use std::path::{Path, PathBuf};
@@ -10,6 +12,7 @@ use std::time::Instant;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use smallem::backend::Primitives;
+use smallem::cli::Args;
 use smallem::data::{Dataset, Shards};
 use smallem::model::{Gpt, GptConfig};
 use smallem::nn::{Architecture, AttentionKind, LatentDims, Module};
@@ -92,7 +95,14 @@ fn bench_batches(data_dir: &Path, batch_size: usize, context: usize) -> Result<(
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let data_dir = PathBuf::from(std::env::args().nth(1).unwrap_or_else(|| "../data".into()));
+    let mut data_dir = PathBuf::from("../data");
+    let mut args = Args::from_env();
+    while let Some(flag) = args.next() {
+        match flag.as_str() {
+            "--data" => data_dir = args.value(&flag)?,
+            other => return Err(format!("option inconnue : {other}").into()),
+        }
+    }
     let train = Dataset::load(data_dir.join("train.bin"))?;
     bench(
         "petit",

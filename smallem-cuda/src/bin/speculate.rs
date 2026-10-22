@@ -23,23 +23,11 @@ use rand::rngs::StdRng;
 use smallem::cli::Args;
 use smallem::data::Dataset;
 use smallem::generation::Generator;
-use smallem::io::{SafeTensors, load_parameters};
-use smallem::model::{Gpt, GptConfig};
+use smallem::io::load_gpt;
+use smallem::model::Gpt;
 use smallem::sampling::Sampling;
 use smallem::speculative::{DraftDecoder, MultiTokenDecoder, Statistics};
 use smallem_cuda::Cuda;
-
-/// Charge un modèle. Avec `inference`, sans son module multi-token.
-fn load(gpu: &Cuda, path: &Path, inference: bool) -> Result<Gpt<Cuda>, Box<dyn Error>> {
-    let file = SafeTensors::read(path)?;
-    let mut config = GptConfig::from_metadata(&file.metadata)?;
-    if inference {
-        config = config.for_inference();
-    }
-    let mut model = Gpt::new(gpu, config, &mut StdRng::seed_from_u64(0));
-    load_parameters(&file, gpu, &mut model)?;
-    Ok(model)
-}
 
 /// Une façon de générer : prolonge une amorce d'au moins `tokens` tokens,
 /// et rend les tokens produits et les statistiques de la spéculation.
@@ -125,12 +113,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         .collect();
     println!("{count} amorces de 32 tokens, {tokens} tokens chacune, température {temperature}");
 
-    let target = load(&gpu, &target_path, true)?;
+    let target = load_gpt(&gpu, &target_path, true)?;
     let (base, reference) = measure("seul", &prompts, tokens, &mut |prompt, tokens, rng| {
         alone(&gpu, &target, prompt, tokens, &sampling, rng)
     });
     for path in drafts.split(',') {
-        let draft = load(&gpu, Path::new(path), true)?;
+        let draft = load_gpt(&gpu, Path::new(path), true)?;
         let name = Path::new(path)
             .file_stem()
             .map_or(path.into(), |s| s.to_string_lossy());
@@ -162,7 +150,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     }
 
-    let mtp = load(&gpu, &mtp_path, false)?;
+    let mtp = load_gpt(&gpu, &mtp_path, false)?;
     let (mtp_base, mtp_reference) = measure(
         "module MTP : seul",
         &prompts,

@@ -9,8 +9,10 @@
 //! - la génération : [`cache`], [`generation`], [`sampling`],
 //!   [`speculative`], [`quantize`] ;
 //! - le post-entraînement : [`chat`], [`tasks`], [`post_training`] ;
+//! - les agents : [`agent`] ;
 //! - les programmes : [`cli`].
 
+pub mod agent;
 pub mod autograd;
 pub mod backend;
 pub mod cache;

@@ -100,7 +100,7 @@ use std::path::{Path, PathBuf};
 use smallem::backend::Backend;
 use smallem::backend::cpu::Cpu;
 use smallem::backend::fast::Fast;
-use smallem::cli::Args;
+use smallem::cli::{Args, at_least_one, check_positive, check_range};
 use smallem::data::{Shards, bytes_per_token};
 use smallem::flops;
 use smallem::generation::generate;
@@ -110,15 +110,13 @@ use smallem::nn::{
     Module, MultiToken,
 };
 use smallem::sampling::Sampling;
-use smallem::tokenizer::Bpe;
+use smallem::tokenizer::{Bpe, TOKENIZER_FILE};
 use smallem::training::{Evaluation, Event, Settings, Trainer, step_rng};
 
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 
 const GENERATED_TOKENS: usize = 400;
-/// Nom du fichier de fusions cherché dans le dossier des données.
-const TOKENIZER_FILE: &str = "tokenizer.bpe";
 
 struct Options {
     config_name: String,
@@ -272,11 +270,12 @@ impl Options {
                 "--positions" => options.architecture.positions = args.value(&flag)?,
                 "--attention" => {
                     options.latent_attention = match args.value::<String>(&flag)?.as_str() {
-                        "standard" => false,
-                        "mla" => true,
+                        AttentionKind::STANDARD => false,
+                        AttentionKind::LATENT => true,
                         other => {
                             return Err(format!(
-                                "--attention : `{other}` inconnu (standard ou mla)"
+                                "--attention : `{other}` inconnu ({})",
+                                AttentionKind::NAMES.join(", ")
                             )
                             .into());
                         }
@@ -333,18 +332,7 @@ impl Options {
                     options.memory.get_or_insert_default().layer = Some(args.value(&flag)?)
                 }
                 "--memory-storage" => {
-                    options.memory.get_or_insert_default().storage =
-                        Some(match args.value::<String>(&flag)?.as_str() {
-                            "dense" => MemoryStorage::Dense,
-                            "sparse" => MemoryStorage::Sparse,
-                            "host" => MemoryStorage::Host,
-                            other => {
-                                return Err(format!(
-                                    "--memory-storage : `{other}` inconnu (dense, sparse ou host)"
-                                )
-                                .into());
-                            }
-                        })
+                    options.memory.get_or_insert_default().storage = Some(args.value(&flag)?)
                 }
                 "--memory-no-gate" => options.memory.get_or_insert_default().no_gate = true,
                 "--memory-no-conv" => options.memory.get_or_insert_default().no_conv = true,
@@ -361,26 +349,15 @@ impl Options {
                 other => return Err(format!("option inconnue : {other}").into()),
             }
         }
-        for (flag, value) in [
-            ("--steps", options.settings.steps),
-            ("--batch", options.settings.batch_size),
-            ("--accumulate", options.settings.accumulate),
-            ("--eval-every", options.settings.eval_every),
-        ] {
-            if value == 0 {
-                return Err(format!("{flag} doit valoir au moins 1").into());
-            }
-        }
-        let (decay, clip) = (
-            options.settings.weight_decay,
-            options.settings.max_grad_norm,
-        );
-        if !(decay.is_finite() && decay >= 0.0) {
-            return Err(format!("--weight-decay : valeur {decay} refusée").into());
-        }
-        if !(clip.is_finite() && clip > 0.0) {
-            return Err(format!("--clip : valeur {clip} refusée").into());
-        }
+        let settings = &options.settings;
+        at_least_one(&[
+            ("--steps", settings.steps),
+            ("--batch", settings.batch_size),
+            ("--accumulate", settings.accumulate),
+            ("--eval-every", settings.eval_every),
+        ])?;
+        check_range("--weight-decay", settings.weight_decay, 0.0..)?;
+        check_positive("--clip", settings.max_grad_norm)?;
         if !options.latent_attention {
             for (flag, value) in [
                 ("--latent", options.latent),
@@ -412,15 +389,24 @@ impl Options {
     /// L'équilibrage demandé, avec son réglage par défaut.
     fn balance(&self) -> Result<Balance, Box<dyn Error>> {
         match (self.balance.as_str(), self.balance_rate) {
-            ("none", None) => Ok(Balance::None),
-            ("none", Some(_)) => Err("--balance-rate demande --balance bias ou loss".into()),
-            ("bias", rate) => Ok(Balance::Bias {
+            (Balance::NONE, None) => Ok(Balance::None),
+            (Balance::NONE, Some(_)) => Err(format!(
+                "--balance-rate demande --balance {} ou {}",
+                Balance::BIAS,
+                Balance::LOSS
+            )
+            .into()),
+            (Balance::BIAS, rate) => Ok(Balance::Bias {
                 rate: rate.unwrap_or(0.001),
             }),
-            ("loss", weight) => Ok(Balance::Loss {
+            (Balance::LOSS, weight) => Ok(Balance::Loss {
                 weight: weight.unwrap_or(0.01),
             }),
-            (other, _) => Err(format!("--balance : `{other}` inconnu (none, bias ou loss)").into()),
+            (other, _) => Err(format!(
+                "--balance : `{other}` inconnu ({})",
+                Balance::NAMES.join(", ")
+            )
+            .into()),
         }
     }
 

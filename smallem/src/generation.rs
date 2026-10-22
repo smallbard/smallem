@@ -196,6 +196,11 @@ impl<'a, B: Backend> Generator<'a, B> {
 /// Une séquence s'arrête quand elle tire `stop`, ou atteint `max_len`
 /// tokens. Sa place dans le cache est alors rendue, et peut servir à une
 /// séquence ajoutée ensuite.
+///
+/// Une séquence qui tire un token de `pause` s'arrête aussi, mais garde sa
+/// place dans le cache : [`Batch::resume`] lui ajoute des tokens et la
+/// relance, sans que le modèle relise ce qu'il a déjà lu. C'est ce dont a
+/// besoin un agent, qui s'interrompt pour appeler un outil.
 pub struct Batch<'a, B: Backend> {
     backend: &'a B,
     model: &'a Gpt<B>,
@@ -203,6 +208,8 @@ pub struct Batch<'a, B: Backend> {
     sequences: Vec<BatchSequence>,
     /// Le token qui termine une séquence, s'il y en a un.
     pub stop: Option<u32>,
+    /// Les tokens qui mettent une séquence en pause.
+    pub pause: Vec<u32>,
     /// Nombre maximal de tokens d'une séquence, amorce comprise.
     pub max_len: usize,
 }
@@ -216,6 +223,9 @@ struct BatchSequence {
     /// Longueur à laquelle la séquence s'arrête, amorce comprise, si elle
     /// en a une à elle.
     limit: Option<usize>,
+    /// Vrai quand la séquence a tiré un token de pause et attend
+    /// [`Batch::resume`].
+    paused: bool,
 }
 
 impl<'a, B: Backend> Batch<'a, B> {
@@ -241,6 +251,7 @@ impl<'a, B: Backend> Batch<'a, B> {
             cache,
             sequences: Vec::new(),
             stop: None,
+            pause: Vec::new(),
             max_len,
         }
     }
@@ -260,8 +271,26 @@ impl<'a, B: Backend> Batch<'a, B> {
             tokens: prompt.to_vec(),
             pending: 0,
             limit,
+            paused: false,
         });
         self.sequences.len() - 1
+    }
+
+    /// Relance la séquence `sequence`, en pause, après lui avoir ajouté
+    /// `tokens`. Elle s'arrêtera désormais à `limit` tokens, amorce comprise.
+    /// Seuls les nouveaux tokens traverseront le modèle.
+    pub fn resume(&mut self, sequence: usize, tokens: &[u32], limit: Option<usize>) {
+        let entry = &mut self.sequences[sequence];
+        assert!(entry.paused, "la séquence {sequence} n'est pas en pause");
+        assert!(!tokens.is_empty(), "une reprise ajoute au moins un token");
+        entry.tokens.extend(tokens);
+        entry.limit = limit;
+        entry.paused = false;
+    }
+
+    /// Vrai si la séquence est en pause.
+    pub fn is_paused(&self, sequence: usize) -> bool {
+        self.sequences[sequence].paused
     }
 
     /// Les numéros des séquences en cours.
@@ -277,6 +306,7 @@ impl<'a, B: Backend> Batch<'a, B> {
     pub fn pages_needed(&self) -> usize {
         self.sequences
             .iter()
+            .filter(|sequence| !sequence.paused)
             .filter_map(|sequence| {
                 let id = sequence.id?;
                 let new = sequence.tokens.len() - sequence.pending;
@@ -291,14 +321,18 @@ impl<'a, B: Backend> Batch<'a, B> {
         &self.sequences[sequence].tokens
     }
 
-    /// Vrai tant que la séquence n'est pas terminée.
+    /// Vrai tant que la séquence n'est ni terminée, ni en pause.
     pub fn is_running(&self, sequence: usize) -> bool {
-        self.sequences[sequence].id.is_some()
+        let sequence = &self.sequences[sequence];
+        sequence.id.is_some() && !sequence.paused
     }
 
-    /// Nombre de séquences en cours.
+    /// Nombre de séquences en cours, hors pauses.
     pub fn running(&self) -> usize {
-        self.sequences.iter().filter(|s| s.id.is_some()).count()
+        self.sequences
+            .iter()
+            .filter(|s| s.id.is_some() && !s.paused)
+            .count()
     }
 
     pub fn cache(&self) -> &KvCache<B> {
@@ -307,6 +341,7 @@ impl<'a, B: Backend> Batch<'a, B> {
 
     /// Termine la séquence `sequence` : sa place dans le cache est rendue.
     pub fn finish(&mut self, sequence: usize) {
+        self.sequences[sequence].paused = false;
         if let Some(id) = self.sequences[sequence].id.take() {
             self.cache.remove_sequence(id);
         }
@@ -333,6 +368,9 @@ impl<'a, B: Backend> Batch<'a, B> {
         let mut owners = Vec::new();
         for (index, sequence) in self.sequences.iter_mut().enumerate() {
             let Some(id) = sequence.id else { continue };
+            if sequence.paused {
+                continue;
+            }
             // Au-delà du contexte, les premiers tokens ne seraient de toute
             // façon plus visibles.
             let window = sequence.tokens.len().saturating_sub(context);
@@ -369,7 +407,8 @@ impl<'a, B: Backend> Batch<'a, B> {
 
     /// Un pas de génération : un token de plus pour chaque séquence en
     /// cours. Rend les tokens tirés, `(numéro, token)`. Les séquences qui
-    /// tirent `stop` ou atteignent `max_len` sont terminées.
+    /// tirent `stop` ou atteignent `max_len` sont terminées ; celles qui
+    /// tirent un token de `pause` sont mises en pause.
     pub fn step(&mut self, sampling: &Sampling, rng: &mut impl Rng) -> Vec<(usize, u32)> {
         let (owners, values) = self.forward();
         let vocab = self.model.config().vocab;
@@ -395,6 +434,8 @@ impl<'a, B: Backend> Batch<'a, B> {
             let limit = sequence.limit.unwrap_or(usize::MAX).min(self.max_len);
             if Some(token) == self.stop || length >= limit {
                 self.finish(index);
+            } else if self.pause.contains(&token) {
+                self.sequences[index].paused = true;
             }
         }
         drawn
@@ -938,6 +979,38 @@ mod tests {
         assert!(!batch.is_running(stopping));
         // L'autre continue, à moins d'avoir tiré le même token.
         assert_eq!(batch.is_running(other), batch.tokens(other)[2] != alone[2]);
+    }
+
+    #[test]
+    fn a_paused_sequence_resumes_where_it_stopped() {
+        // Mise en pause sur son premier token, puis relancée avec deux
+        // tokens de plus : elle continue comme une séquence qui aurait reçu
+        // le tout pour amorce, sans relire ce qu'elle a déjà lu.
+        let backend = Cpu::new();
+        let model = rotary_model(&backend, 2);
+        let mut rng = StdRng::seed_from_u64(1);
+        let alone = generate(&backend, &model, &[3, 7], 1, &GREEDY, &mut rng);
+        let mut batch = Batch::new(&backend, &model, 2);
+        batch.pause = vec![alone[2]];
+        let paused = batch.add(&[3, 7]);
+        let other = batch.add(&[10, 0]);
+        batch.step(&GREEDY, &mut rng);
+        assert!(batch.is_paused(paused) && !batch.is_running(paused));
+        // L'autre avance pendant la pause, à moins d'avoir tiré le même token.
+        if batch.is_running(other) {
+            batch.step(&GREEDY, &mut rng);
+            assert_eq!(batch.tokens(paused).len(), 3);
+        }
+        batch.resume(paused, &[5, 1], None);
+        assert!(batch.is_running(paused));
+        let pages = batch.cache().free_pages();
+        batch.step(&GREEDY, &mut rng);
+        let whole = [3, 7, alone[2], 5, 1];
+        let expected = generate(&backend, &model, &whole, 1, &GREEDY, &mut rng);
+        assert_eq!(batch.tokens(paused), &expected[..]);
+        // Pas une page de plus : les trois premiers tokens sont restés dans
+        // le cache, et la page de seize lignes a la place pour les suivants.
+        assert_eq!(batch.cache().free_pages(), pages);
     }
 
     #[test]

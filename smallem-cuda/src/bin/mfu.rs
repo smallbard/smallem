@@ -1,12 +1,12 @@
 //! Le rendement de la carte : les opérations utiles d'un pas
 //! d'entraînement, par seconde, rapportées au maximum de la RTX 3090.
 //!
-//! Usage : `cargo oxide run --bin mfu -- [largeurs]`
+//! Usage : `cargo oxide run --bin mfu -- [--widths 128,256,512]`
 //!
-//! Sans argument, mesure les configurations `small`, `large` et `xl` en
-//! architecture moderne. Avec une liste de largeurs (`128,256,512`), mesure
-//! la famille des lois d'échelle : têtes de 64, autant de couches que de
-//! têtes. Lots de 16 séquences de 512 tokens, précision mixte, Muon.
+//! Sans option, mesure les configurations `small`, `large` et `xl` en
+//! architecture moderne. Avec `--widths`, mesure la famille des lois
+//! d'échelle à ces largeurs : têtes de 64, autant de couches que de têtes.
+//! Lots de 16 séquences de 512 tokens, précision mixte, Muon.
 
 use std::error::Error;
 use std::time::Instant;
@@ -14,6 +14,7 @@ use std::time::Instant;
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 use smallem::backend::Primitives;
+use smallem::cli::Args;
 use smallem::flops::{six_n_d, training_flops};
 use smallem::model::{Gpt, GptConfig};
 use smallem::nn::{Architecture, Module};
@@ -30,7 +31,15 @@ const STEPS: usize = 10;
 
 fn main() -> Result<(), Box<dyn Error>> {
     let vocab = 8192;
-    let configs: Vec<(String, GptConfig)> = match std::env::args().nth(1) {
+    let mut widths: Option<String> = None;
+    let mut args = Args::from_env();
+    while let Some(flag) = args.next() {
+        match flag.as_str() {
+            "--widths" => widths = Some(args.value(&flag)?),
+            other => return Err(format!("option inconnue : {other}").into()),
+        }
+    }
+    let configs: Vec<(String, GptConfig)> = match widths {
         None => vec![
             ("small".into(), GptConfig::small(vocab)),
             ("large".into(), GptConfig::large(vocab)),
@@ -39,7 +48,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some(list) => list
             .split(',')
             .map(|width| {
-                let embed: usize = width.parse().expect("une largeur");
+                let embed: usize = width
+                    .parse()
+                    .ok()
+                    .filter(|embed| embed % 64 == 0 && *embed > 0)
+                    .ok_or_else(|| format!("--widths : `{width}` n'est pas un multiple de 64"))?;
                 let config = GptConfig {
                     embed,
                     heads: embed / 64,
@@ -47,9 +60,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                     context: 512,
                     ..GptConfig::xl(vocab)
                 };
-                (format!("C = {embed}"), config)
+                Ok((format!("C = {embed}"), config))
             })
-            .collect(),
+            .collect::<Result<_, String>>()?,
     };
     println!(
         "{:<10} {:>12} {:>6} {:>12} {:>12} {:>10} {:>12} {:>8}",

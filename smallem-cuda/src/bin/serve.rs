@@ -46,8 +46,8 @@ use smallem::cache::{KvCache, PAGE_SIZE};
 use smallem::cli::Args;
 use smallem::data::Dataset;
 use smallem::generation::Batch;
-use smallem::io::{SafeTensors, load_parameters};
-use smallem::model::{Gpt, GptConfig};
+use smallem::io::load_gpt;
+use smallem::model::Gpt;
 use smallem::sampling::Sampling;
 use smallem_cuda::Cuda;
 
@@ -265,11 +265,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             other => return Err(format!("option inconnue : {other}").into()),
         }
     }
-    let file = SafeTensors::read(&model_path)?;
-    let config = GptConfig::from_metadata(&file.metadata)?.for_inference();
     let gpu = smallem_cuda::gpu(false)?;
-    let mut model = Gpt::new(&gpu, config, &mut StdRng::seed_from_u64(0));
-    load_parameters(&file, &gpu, &mut model)?;
+    let model = load_gpt(&gpu, &model_path, true)?;
+    let config = model.config();
     let data = Dataset::load(&data_path)?;
     let numbers = config.cache_numbers_per_position();
     let lines = (cache_mib << 20) / (4 * numbers);
